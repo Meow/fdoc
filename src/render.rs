@@ -99,7 +99,7 @@ fn layout(project: &Project, path: &str, title: &str, active: Active, body: &str
 <div class="content-inner" id="content-inner">
 {body}
 <footer class="footer">
-<p>Built with <a href="https://github.com/TeslaCloud/fdoc">fdoc</a>.</p>
+<p>Built with <a href="https://github.com/Meow/fdoc">fdoc</a>.</p>
 </footer>
 </div>
 </main>
