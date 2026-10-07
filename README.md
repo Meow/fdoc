@@ -126,3 +126,7 @@ cannot contain spaces, since the first space ends it.
 ```sh
 cargo test
 ```
+
+## License
+
+Released under the [MIT License](LICENSE).
