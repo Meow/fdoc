@@ -2,7 +2,7 @@
 
 use std::fmt::Write;
 
-use crate::doc::{DocBlock, Realm, Return};
+use crate::doc::{summary_of, DocBlock, Realm, Return};
 use crate::html::{esc, json_str};
 use crate::markdown;
 use crate::model::{Function, FunctionKind, Group, Module, ModuleKind, Project};
@@ -224,11 +224,6 @@ fn split_first_paragraph(text: &str) -> (String, String) {
     }
 }
 
-/// The first sentence of a free-form description, as used in listings.
-fn text_summary(text: &str) -> String {
-    DocBlock { description: text.to_string(), ..DocBlock::default() }.summary()
-}
-
 fn type_html(ty: &Option<String>) -> String {
     match ty {
         Some(t) => format!("<span class=\"type\">{}</span>", esc(t)),
@@ -267,7 +262,7 @@ fn project_index(project: &Project) -> String {
                     dir = group.dir,
                     title = esc(&group.title),
                     n = group.modules.len(),
-                    desc = group.description.as_deref().map(|d| md_inline(project, &root, &text_summary(d))).unwrap_or_default(),
+                    desc = group.description.as_deref().map(|d| md_inline(project, &root, &summary_of(d))).unwrap_or_default(),
                 );
             }
         }
@@ -327,8 +322,8 @@ fn module_page(project: &Project, group: &Group, m: &Module) -> String {
         badge = m.kind.badge(),
         realm = module_realm(m).map(realm_pill).unwrap_or_default(),
     );
-    let lead = if m.kind == ModuleKind::Hooks { m.subtitle.as_ref() } else { None };
-    if let Some(sub) = m.subtitle.as_ref().filter(|_| lead.is_none()) {
+    let (subtitle, lead) = if m.kind == ModuleKind::Hooks { (None, m.subtitle.as_ref()) } else { (m.subtitle.as_ref(), None) };
+    if let Some(sub) = subtitle {
         let _ = write!(body, "<p class=\"subtitle\">{}</p>", esc(sub));
     }
     if let ModuleKind::Class { extends: Some(base) } = &m.kind {
@@ -422,7 +417,7 @@ fn function_detail(project: &Project, root: &str, f: &Function) -> String {
     out.push_str(&hook_info(project, root, f));
     match (&f.doc, &f.client_doc) {
         (doc, Some(client)) => {
-            let (realm, label) = match f.sources[0].2 {
+            let (realm, label) = match f.doc_realm {
                 Realm::Shared => ("shared", "Shared"),
                 _ => ("server", "On the server"),
             };
@@ -668,7 +663,7 @@ fn search_data(project: &Project) -> String {
     for section in &project.sections {
         for group in &section.groups {
             if !group.is_core {
-                items.push(entry(&group.title, "group", &format!("{}/index.html", group.dir), &text_summary(group.description.as_deref().unwrap_or("")), &section.title, None));
+                items.push(entry(&group.title, "group", &format!("{}/index.html", group.dir), &summary_of(group.description.as_deref().unwrap_or("")), &section.title, None));
             }
             for m in &group.modules {
                 let page = format!("{}/{}.html", group.dir, m.slug);
@@ -700,7 +695,7 @@ fn truncate(s: &str, max: usize) -> String {
 mod tests {
     use super::*;
     use crate::layout::Layout;
-    use crate::model::{build, BuildOptions};
+    use crate::model::{build, placed, BuildOptions};
     use std::collections::HashMap;
     use crate::scanner::scan;
 
@@ -719,7 +714,7 @@ mod tests {
         ];
         let layout = Layout::default_for("Test");
         let meta = HashMap::new();
-        let project = build(files, BuildOptions { title: Some("Test"), source_url: Some("https://example.com/"), ..BuildOptions::new(&layout, &meta) });
+        let project = build(placed(&layout, files), BuildOptions { title: Some("Test"), source_url: Some("https://example.com/"), ..BuildOptions::new(&layout, &meta) });
         let pages = render_all(&project);
         let page = |path: &str| pages.iter().find(|p| p.path == path).map(|p| p.content.as_str()).unwrap_or_else(|| panic!("no page {path}"));
 

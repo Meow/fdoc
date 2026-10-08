@@ -32,17 +32,6 @@ pub enum Realm {
 }
 
 impl Realm {
-    /// Combines two realms: a specific realm overrides `Shared`, and
-    /// `Server` with `Client` is `Shared`.
-    #[allow(dead_code)]
-    pub fn combine(self, other: Realm) -> Realm {
-        match (self, other) {
-            (Realm::Shared, r) | (r, Realm::Shared) => r,
-            (a, b) if a == b => a,
-            _ => Realm::Shared,
-        }
-    }
-
     /// The other side: `Server` and `Client` swap, `Shared` stays.
     pub fn opposite(self) -> Realm {
         match self {
@@ -128,27 +117,32 @@ impl DocBlock {
 
     /// First sentence of the first paragraph of the description.
     pub fn summary(&self) -> String {
-        first_sentence(&self.first_paragraph()).to_string()
+        summary_of(&self.description)
     }
+}
 
-    /// First paragraph of the description, joined into one line.
-    pub fn first_paragraph(&self) -> String {
-        let mut out = Vec::new();
-        for line in self.description.lines() {
-            let t = line.trim();
-            if t.is_empty() || t.starts_with("```") {
-                if !out.is_empty() {
-                    break;
-                }
-                if t.starts_with("```") {
-                    break;
-                }
-                continue;
+/// First sentence of the first paragraph of a Markdown text.
+pub fn summary_of(text: &str) -> String {
+    first_sentence(&first_paragraph(text)).to_string()
+}
+
+/// First paragraph of a Markdown text, joined into one line.
+fn first_paragraph(text: &str) -> String {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let t = line.trim();
+        if t.is_empty() || t.starts_with("```") {
+            if !out.is_empty() {
+                break;
             }
-            out.push(t);
+            if t.starts_with("```") {
+                break;
+            }
+            continue;
         }
-        out.join(" ")
+        out.push(t);
     }
+    out.join(" ")
 }
 
 /// Cuts `text` after its first sentence: a `.`, `!` or `?` followed by
@@ -667,11 +661,7 @@ mod tests {
     }
 
     #[test]
-    fn combines_realms() {
-        assert_eq!(Realm::Shared.combine(Realm::Server), Realm::Server);
-        assert_eq!(Realm::Client.combine(Realm::Shared), Realm::Client);
-        assert_eq!(Realm::Server.combine(Realm::Client), Realm::Shared);
-        assert_eq!(Realm::Server.combine(Realm::Server), Realm::Server);
+    fn opposes_realms() {
         assert_eq!(Realm::Server.opposite(), Realm::Client);
         assert_eq!(Realm::Shared.opposite(), Realm::Shared);
     }

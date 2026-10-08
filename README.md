@@ -19,7 +19,7 @@ cargo build --release
 | `--config <FILE>` | Layout and project settings (default: `<SOURCE_DIR>/.fdoc.yml` if it exists); see [below](#configuration) |
 | `--title <NAME>` | Project name (default: the config's `title`, else the `name` in `packagespec.lua`, else the directory name) |
 | `--source-url <URL>` | Base URL that source paths are appended to for "view source" links |
-| `--exclude <NAME>` | Directory name, or path relative to the source directory, to skip; repeatable (default: `docs`, `.git`) |
+| `--exclude <NAME>` | Directory name to skip anywhere, or a path with a `/` (such as `./lib` or `a/b.lua`) relative to the source directory; repeatable (default: `docs`, `.git`) |
 | `--documented-only` | Only include functions that have a doc comment |
 | `--clean` | Delete the output directory before generating |
 | `-q, --quiet` | Only print errors |
@@ -96,8 +96,10 @@ sections:                      # sidebar tabs, in order
       - path: gamemodes/cwhl2rp/plugins/*
 ```
 
-An `exclude` entry without a `/` skips every directory of that name; one with
-a `/` skips that path, relative to the source directory.
+An `exclude` entry without a `/`, or with only a trailing one (`thirdparty/`),
+skips every directory of that name. One with any other `/`, such as `./lib`,
+`gamemodes/catwork/gamemode/thirdparty` or `./packagespec.lua`, skips the
+directory or file at that path, relative to the source directory.
 
 A group `path` is relative to the source directory. A `*` component matches
 any directory and makes one group per match; `*.lua` as the last component
@@ -124,8 +126,14 @@ A core group is titled by its `name` or `plugin.ini`, else after its section.
 
 Pages are written to `<section>/` for the first core group of a section and to
 `<section>/<group>/` for the others, where `<section>` is the lower-cased
-section title. The default layout keeps Flux's directories: `flux/`,
-`packages/<name>/` and `plugins/<name>/`.
+section title and `<group>` the group's `name`, its last path component, or
+what `*` matched. When a section has several `*` paths (a `*` path and the
+`*.lua` path next to it count as one), the groups of each go to
+`<section>/<path>/<group>/` instead, where `<path>` is the path's components
+other than `*` joined with `-`, such as `plugins/gamemodes-a-plugins/stamina/`.
+Groups of different paths are never merged: a directory that is taken already
+gets a `-2`, `-3`, ... suffix. The default layout keeps Flux's directories:
+`flux/`, `packages/<name>/` and `plugins/<name>/`.
 
 ### Modules
 

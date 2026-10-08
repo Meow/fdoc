@@ -3,6 +3,7 @@
 //! each of them, plus the hooks the file runs and adds, its file-local
 //! objects, realm blocks and metadata.
 
+use std::collections::BTreeSet;
 use std::ops::Range;
 
 pub use crate::doc::Realm;
@@ -144,7 +145,7 @@ pub struct FileScan {
     pub locals: Vec<LocalTable>,
     /// Every name a `local` statement declares, at any depth: variables
     /// (`local a, b = ...`) and `local function` names.
-    pub local_names: Vec<String>,
+    pub local_names: BTreeSet<String>,
     /// Hook calls with a string literal name (see `HOOK_CALLERS`).
     pub hook_calls: Vec<HookCall>,
     /// `hook.Add` calls with a string literal name.
@@ -350,11 +351,7 @@ pub fn scan(src: &str) -> FileScan {
                     continue;
                 }
                 "local" => {
-                    for name in local_names(&toks, i) {
-                        if !s.out.local_names.contains(&name) {
-                            s.out.local_names.push(name);
-                        }
-                    }
+                    s.out.local_names.extend(local_names(&toks, i));
                     // `local x = FindMetaTable('Y')`, `local function`, `local x = <expr>`.
                     if let Some((alias, target)) = parse_meta_alias(&toks, i) {
                         s.out.meta_aliases.push((alias, target));
@@ -1228,7 +1225,7 @@ end
         assert!(scan.hook_calls[2].doc.is_none());
         assert!(scan.file_doc.is_none(), "the block belongs to the hook call");
         assert_eq!(scan.functions.len(), 2, "the local function stays private");
-        assert_eq!(scan.local_names, vec!["loadout", "helper", "c", "d"], "locals at any depth");
+        assert_eq!(scan.local_names, ["c", "d", "helper", "loadout"].map(String::from).into(), "locals at any depth");
     }
 
     #[test]

@@ -104,6 +104,10 @@ pub struct Function {
     /// Every definition (file, line, realm), the primary one first. More
     /// than one for merged realm twins; every call site for a hook.
     pub sources: Vec<(String, usize, Realm)>,
+    /// Realm of the definition `doc` comes from. For merged twins it can
+    /// differ from the primary definition's realm, when that one is not
+    /// documented.
+    pub doc_realm: Realm,
     /// The client definition's doc of a merged twin, when it differs from
     /// `doc`.
     pub client_doc: Option<DocBlock>,
@@ -210,8 +214,8 @@ pub struct BuildOptions<'a> {
     pub source_url: Option<&'a str>,
     /// Which files form which groups and sections.
     pub layout: &'a Layout,
-    /// Metadata from `plugin.ini` files, by the group's output directory
-    /// (`Placement::dir`).
+    /// Metadata from `plugin.ini` files, by the group's source directory
+    /// (`Placement::source_dir`).
     pub group_meta: &'a HashMap<String, GroupMeta>,
 }
 
@@ -222,8 +226,10 @@ impl<'a> BuildOptions<'a> {
     }
 }
 
-fn file_stem(path: &str) -> String {
-    path.rsplit('/').next().unwrap_or(path).trim_end_matches(".lua").to_string()
+/// The last component of a `/` separated path without its `.lua` extension.
+pub fn file_stem(path: &str) -> &str {
+    let last = path.rsplit('/').next().unwrap_or(path);
+    last.strip_suffix(".lua").unwrap_or(last)
 }
 
 /// The file stem without its `sv_`, `cl_` or `sh_` realm prefix.
@@ -234,7 +240,7 @@ fn bare_stem(path: &str) -> String {
             return rest.to_string();
         }
     }
-    stem
+    stem.to_string()
 }
 
 /// The name of the directory a file is in, if any.
@@ -260,14 +266,18 @@ struct GroupBuilder {
     files: Vec<(String, FileScan)>,
 }
 
+/// A scanned source file: its path relative to the source root, the group
+/// of the layout it belongs to, and what it declares.
+pub type PlacedFile = (String, Placement, FileScan);
+
 /// The first value of `key` in the root `packagespec.lua`.
-fn root_spec(files: &[(String, FileScan)], key: &str) -> Option<String> {
-    files.iter().filter(|(path, _)| path == "packagespec.lua").flat_map(|(_, scan)| &scan.spec).find(|(k, _)| k == key).map(|(_, v)| v.clone())
+fn root_spec(files: &[PlacedFile], key: &str) -> Option<String> {
+    files.iter().filter(|(path, _, _)| path == "packagespec.lua").flat_map(|(_, _, scan)| &scan.spec).find(|(k, _)| k == key).map(|(_, v)| v.clone())
 }
 
 /// The project name: `title`, else the root packagespec's name, else
 /// `fallback`.
-pub fn project_title(files: &[(String, FileScan)], title: Option<&str>, fallback: Option<&str>) -> String {
+pub fn project_title(files: &[PlacedFile], title: Option<&str>, fallback: Option<&str>) -> String {
     title.map(str::to_string).or_else(|| root_spec(files, "name")).or_else(|| fallback.map(str::to_string)).unwrap_or_else(|| "Documentation".to_string())
 }
 
@@ -287,21 +297,30 @@ fn package_meta(scan: &FileScan) -> GroupMeta {
     meta
 }
 
-pub fn build(files: Vec<(String, FileScan)>, opts: BuildOptions) -> Project {
+/// Places each file in its group of `layout`, leaving out the files that
+/// match no group.
+#[cfg(test)]
+pub fn placed(layout: &Layout, files: Vec<(String, FileScan)>) -> Vec<PlacedFile> {
+    files.into_iter().filter_map(|(path, scan)| layout.classify(&path).map(|place| (path, place, scan))).collect()
+}
+
+/// Builds the project from the files, each placed in a group of
+/// `opts.layout`.
+pub fn build(files: Vec<PlacedFile>, opts: BuildOptions) -> Project {
     let title = project_title(&files, opts.title, opts.fallback_title);
     let version = opts.version.map(str::to_string).or_else(|| root_spec(&files, "version"));
     let summary = opts.summary.map(str::to_string).or_else(|| root_spec(&files, "summary"));
     let description = opts.description.map(str::to_string).or_else(|| root_spec(&files, "description"));
     let layout = opts.layout;
 
-    // Gather files per group, keyed by output directory. `PLUGIN:set_*`
+    // Gather files per group, keyed by section, spec family and key, so
+    // that groups of different specs are never merged. `PLUGIN:set_*`
     // calls and `PLUGIN.name = ...` fields fill the builder; the group's own
     // packagespec is kept aside.
-    let mut groups: BTreeMap<String, (Placement, GroupMeta, GroupBuilder)> = BTreeMap::new();
+    let mut groups: BTreeMap<(usize, usize, String), (Placement, GroupMeta, GroupBuilder)> = BTreeMap::new();
     let mut called: HashSet<String> = HashSet::new();
-    for (path, scan) in files {
-        let Some(place) = layout.classify(&path) else { continue };
-        let (place, spec, g) = groups.entry(place.dir.clone()).or_insert_with(|| {
+    for (path, place, scan) in files {
+        let (place, spec, g) = groups.entry((place.section, place.family, place.key.clone())).or_insert_with(|| {
             let g = GroupBuilder { name: None, description: None, author: None, version: None, plugin_global: None, source_dir: place.source_dir.clone(), files: Vec::new() };
             (place, GroupMeta::default(), g)
         });
@@ -328,11 +347,15 @@ pub fn build(files: Vec<(String, FileScan)>, opts: BuildOptions) -> Project {
     let mut sections: Vec<Section> = layout.sections.iter().map(|s| Section { title: s.title.clone(), groups: Vec::new() }).collect();
     let mut placed: Vec<(Placement, Group)> = Vec::new();
     let mut dirs: HashSet<String> = HashSet::new();
-    for (place, spec, mut gb) in groups.into_values() {
+    // Groups of specs without a `*` keep their directory when one made by a
+    // `*` collides with it.
+    let mut groups: Vec<(Placement, GroupMeta, GroupBuilder)> = groups.into_values().collect();
+    groups.sort_by_key(|(place, _, _)| layout.group(place).is_pattern());
+    for (place, spec, mut gb) in groups {
         // Name priority: the layout, plugin.ini, packagespec, `PLUGIN:set_name`,
         // the path. Core groups are named after their section instead.
         let fixed = layout.group(&place).name.clone();
-        let ini = opts.group_meta.get(&place.dir).cloned().unwrap_or_default();
+        let ini = opts.group_meta.get(&place.source_dir).cloned().unwrap_or_default();
         let section_title = &layout.sections[place.section].title;
         let group_title = if place.core {
             let title = fixed.clone().or(ini.name.clone()).unwrap_or_else(|| section_title.clone());
@@ -358,7 +381,7 @@ pub fn build(files: Vec<(String, FileScan)>, opts: BuildOptions) -> Project {
         placed.push((place, group));
     }
     // Core groups first, then by key.
-    placed.sort_by(|(a, _), (b, _)| b.core.cmp(&a.core).then_with(|| a.key.to_ascii_lowercase().cmp(&b.key.to_ascii_lowercase())).then_with(|| a.dir.cmp(&b.dir)));
+    placed.sort_by(|(a, ga), (b, gb)| b.core.cmp(&a.core).then_with(|| a.key.to_ascii_lowercase().cmp(&b.key.to_ascii_lowercase())).then_with(|| ga.dir.cmp(&gb.dir)));
     for (place, group) in placed {
         sections[place.section].groups.push(group);
     }
@@ -500,12 +523,13 @@ fn name_id(name: &str) -> String {
     if !name.contains(char::is_whitespace) {
         return name.to_string();
     }
-    name.split_whitespace()
-        .map(|word| {
-            let mut chars = word.chars();
-            chars.next().map(|c| c.to_uppercase().chain(chars).collect::<String>()).unwrap_or_default()
-        })
-        .collect()
+    name.split_whitespace().map(capitalize).collect()
+}
+
+/// `s` with its first character in upper case.
+fn capitalize(s: &str) -> String {
+    let mut chars = s.chars();
+    chars.next().map(|c| c.to_uppercase().chain(chars).collect()).unwrap_or_default()
 }
 
 /// The display title an object's fields give it (`ENT.PrintName = 'Item'`),
@@ -519,10 +543,6 @@ fn title_field(scan: &FileScan, object: &str) -> Option<String> {
 /// The object name used in generated ids: `CLASS_TABLE` -> `Class`,
 /// `PANEL` -> `Panel`, `ITEM_META` -> `ItemMeta`, `stored` -> `Stored`.
 fn object_word(local: &str) -> String {
-    let capitalize = |s: &str| {
-        let mut chars = s.chars();
-        chars.next().map(|c| c.to_uppercase().chain(chars).collect::<String>()).unwrap_or_default()
-    };
     if local.chars().any(|c| c.is_ascii_lowercase()) {
         return capitalize(local);
     }
@@ -703,7 +723,7 @@ fn owner_target(gb: &GroupBuilder, group_title: &str, path: &str, scan: &FileSca
             t.subtitle = Some(entity_label(first));
             return t;
         }
-        let id = if first == "PANEL" { scan.vgui_name.clone().unwrap_or_else(|| file_stem(path)) } else { file_stem(path) };
+        let id = if first == "PANEL" { scan.vgui_name.clone().unwrap_or_else(|| file_stem(path).to_string()) } else { file_stem(path).to_string() };
         let mut t = Target::new(format!("\u{2}file\u{0}{first}\u{0}{path}"), id.clone(), kind);
         t.title = title_field(scan, first).unwrap_or(id);
         t.subtitle = Some(format!("Object {first} in {rel}"));
@@ -740,17 +760,20 @@ fn add_function(m: &mut Module, f: Function) {
 }
 
 /// Merges `f` into its twin `e`. The shared, else the server definition
-/// is the primary one; its doc wins, and a differing client doc is kept
-/// as `client_doc`.
+/// is the primary one. The doc of the shared, else the server, else the
+/// client definition wins, and a differing client doc is kept as
+/// `client_doc`.
 fn merge_twin(e: &mut Function, mut f: Function) {
     if realm_rank(f.realm) < realm_rank(e.sources[0].2) {
         std::mem::swap(e, &mut f);
     }
-    let candidates = [(e.sources[0].2, e.doc.take()), (Realm::Client, e.client_doc.take()), (f.sources[0].2, f.doc.take()), (Realm::Client, f.client_doc.take())];
+    let candidates = [(e.doc_realm, e.doc.take()), (Realm::Client, e.client_doc.take()), (f.doc_realm, f.doc.take()), (Realm::Client, f.client_doc.take())];
     let mut docs: Vec<(Realm, DocBlock)> = candidates.into_iter().filter_map(|(r, d)| d.map(|d| (r, d))).collect();
     docs.sort_by_key(|(r, _)| realm_rank(*r));
     let mut docs = docs.into_iter();
-    e.doc = docs.next().map(|(_, d)| d);
+    let (doc_realm, doc) = docs.next().map_or((e.sources[0].2, None), |(r, d)| (r, Some(d)));
+    e.doc_realm = doc_realm;
+    e.doc = doc;
     e.client_doc = docs.find(|(r, d)| *r == Realm::Client && !e.doc.as_ref().is_some_and(|p| same_text(p, d))).map(|(_, d)| d);
     e.sources.extend(f.sources);
     e.realm = Realm::Shared;
@@ -863,6 +886,7 @@ fn build_modules(gb: &GroupBuilder, group_title: &str, documented_only: bool, ca
                     kind: FunctionKind::Declared,
                     realm,
                     sources: vec![(path.clone(), f.line, realm)],
+                    doc_realm: realm,
                     client_doc: None,
                     callers: Vec::new(),
                     hook_id: None,
@@ -908,6 +932,7 @@ fn build_modules(gb: &GroupBuilder, group_title: &str, documented_only: bool, ca
                 kind: FunctionKind::HookAdd,
                 realm,
                 sources: vec![(path.clone(), add.line, realm)],
+                doc_realm: realm,
                 client_doc: None,
                 callers: Vec::new(),
                 hook_id: add.id.clone(),
@@ -958,6 +983,7 @@ fn build_modules(gb: &GroupBuilder, group_title: &str, documented_only: bool, ca
             kind: FunctionKind::Hook,
             realm,
             sources,
+            doc_realm: realm,
             client_doc: None,
             callers: sites.iter().filter_map(|(p, c)| c.caller.as_ref().map(|caller| format!("{p}\u{0}{caller}"))).collect(),
             hook_id: None,
@@ -1034,7 +1060,7 @@ fn build_modules(gb: &GroupBuilder, group_title: &str, documented_only: bool, ca
             Some(holder) => holder.clone(),
         };
         let parent = |p: &str| parent_dir(p).unwrap_or("").to_string();
-        let candidates = [(bare_stem(&file), bare_stem(&holder)), (parent(&file), parent(&holder)), (file_stem(&file), file_stem(&holder))];
+        let candidates = [(bare_stem(&file), bare_stem(&holder)), (parent(&file), parent(&holder)), (file_stem(&file).to_string(), file_stem(&holder).to_string())];
         let readable = candidates
             .into_iter()
             .filter(|(d, theirs)| !d.is_empty() && d != theirs && !d.eq_ignore_ascii_case(&m.id))
@@ -1254,7 +1280,7 @@ mod tests {
     fn builds_sections_and_modules() {
         let layout = Layout::default_for("Flux");
         let meta = HashMap::new();
-        let p = build(files(), BuildOptions { fallback_title: Some("fallback"), ..BuildOptions::new(&layout, &meta) });
+        let p = build(placed(&layout, files()), BuildOptions { fallback_title: Some("fallback"), ..BuildOptions::new(&layout, &meta) });
         assert_eq!(p.title, "Flux");
         assert_eq!(p.version.as_deref(), Some("1.0"));
         assert_eq!(p.sections.len(), 3);
@@ -1302,14 +1328,14 @@ mod tests {
         .unwrap();
         let layout = config.layout.unwrap();
         let mut meta = HashMap::new();
-        meta.insert("plugins/stamina".to_string(), GroupMeta { name: Some("Stamina".into()), description: None, author: Some("kurozael".into()), version: Some("0.93".into()) });
+        meta.insert("gm/plugins/stamina".to_string(), GroupMeta { name: Some("Stamina".into()), description: None, author: Some("kurozael".into()), version: Some("0.93".into()) });
         let files = vec![
             ("gm/gamemode/core/sh_kernel.lua".to_string(), scan("function Kernel.Init() end")),
             ("gm/plugins/stamina/plugin/sh_plugin.lua".to_string(), scan("PLUGIN:set_name('Ignored')\nPLUGIN:set_description('From code.')\nfunction PLUGIN:Think() end")),
             ("gm/plugins/sh_raisegun.lua".to_string(), scan("function PLUGIN:Think() end")),
             ("gm/other/x.lua".to_string(), scan("function x() end")),
         ];
-        let p = build(files, BuildOptions { title: Some("Catwork"), ..BuildOptions::new(&layout, &meta) });
+        let p = build(placed(&layout, files), BuildOptions { title: Some("Catwork"), ..BuildOptions::new(&layout, &meta) });
         let sections: Vec<&str> = p.sections.iter().map(|s| s.title.as_str()).collect();
         assert_eq!(sections, vec!["Catwork", "Plugins"]);
         let core = &p.sections[0].groups[0];
@@ -1324,10 +1350,36 @@ mod tests {
     }
 
     #[test]
+    fn never_merges_groups_of_different_specs() {
+        let config = crate::layout::Config::from_yaml(
+            "sections:
+  - title: Plugins
+    groups:
+      - path: plugins/*
+      - { path: extra/stamina, name: stamina }
+      - path: gamemodes/a/plugins
+      - path: gamemodes/b/plugins
+",
+        )
+        .unwrap();
+        let layout = config.layout.unwrap();
+        let meta = HashMap::new();
+        let files = vec![
+            ("plugins/stamina/sh_plugin.lua".to_string(), scan("function Pattern.x() end")),
+            ("extra/stamina/sh_plugin.lua".to_string(), scan("function Named.x() end")),
+            ("gamemodes/a/plugins/sh_a.lua".to_string(), scan("function A.x() end")),
+            ("gamemodes/b/plugins/sh_b.lua".to_string(), scan("function B.x() end")),
+        ];
+        let p = build(placed(&layout, files), BuildOptions { title: Some("X"), ..BuildOptions::new(&layout, &meta) });
+        let groups: Vec<(&str, Vec<&str>)> = p.sections[0].groups.iter().map(|g| (g.dir.as_str(), g.modules.iter().map(|m| m.id.as_str()).collect())).collect();
+        assert_eq!(groups, vec![("plugins/stamina", vec!["Named"]), ("plugins/plugins", vec!["A"]), ("plugins/plugins-2", vec!["B"]), ("plugins/stamina-2", vec!["Pattern"])]);
+    }
+
+    #[test]
     fn resolves_references() {
         let layout = Layout::default_for("Flux");
         let meta = HashMap::new();
-        let p = build(files(), BuildOptions { fallback_title: Some("fallback"), ..BuildOptions::new(&layout, &meta) });
+        let p = build(placed(&layout, files()), BuildOptions { fallback_title: Some("fallback"), ..BuildOptions::new(&layout, &meta) });
         assert_eq!(p.resolve("Core::A#other").as_deref(), Some("flux/Core.A.html#other"));
         assert_eq!(p.resolve("Core.A:do_x").as_deref(), Some("flux/Core.A.html#do_x"));
         assert_eq!(p.resolve("Core.A").as_deref(), Some("flux/Core.A.html"));
@@ -1341,7 +1393,7 @@ mod tests {
         let layout = Layout::default_for("Flux");
         let meta = HashMap::new();
         let files = files.into_iter().map(|(p, src)| (p.to_string(), scan(src))).collect();
-        let p = build(files, BuildOptions { title: Some("Flux"), ..BuildOptions::new(&layout, &meta) });
+        let p = build(placed(&layout, files), BuildOptions { title: Some("Flux"), ..BuildOptions::new(&layout, &meta) });
         p.sections.into_iter().next().map(|s| s.groups.into_iter().next().unwrap().modules).unwrap_or_default()
     }
 
@@ -1404,6 +1456,19 @@ mod tests {
         let think = &get("cw_item", "Think")[0];
         assert_eq!((think.realm, think.file.as_str(), think.sources.len()), (Realm::Shared, "entities/entities/cw_item/init.lua", 2));
         assert_eq!(get("cw_item", "Draw")[0].realm, Realm::Client);
+    }
+
+    #[test]
+    fn keeps_the_client_doc_adopted_by_an_undocumented_twin() {
+        let modules = core(vec![
+            ("entities/entities/cw_lamp/cl_init.lua", "--- Draws the glow.\nfunction ENT:Think() end"),
+            ("entities/entities/cw_lamp/init.lua", "function ENT:Think() end"),
+            ("entities/entities/cw_lamp/shared.lua", "--- Updates the lamp.\nfunction ENT:Think() end"),
+        ]);
+        let think = &module(&modules, "cw_lamp").functions[0];
+        assert_eq!((think.realm, think.file.as_str(), think.sources.len()), (Realm::Shared, "entities/entities/cw_lamp/shared.lua", 3));
+        assert_eq!((think.summary(), think.doc_realm), ("Updates the lamp.".to_string(), Realm::Shared));
+        assert_eq!(think.client_doc.as_ref().map(|d| d.summary()).as_deref(), Some("Draws the glow."), "the client doc survives the later merge");
     }
 
     #[test]
@@ -1493,7 +1558,7 @@ mod tests {
             ("plugins/stamina/sh_plugin.lua".to_string(), scan("PLUGIN:SetGlobalAlias('cwStamina')\nfunction cwStamina:PlayerModelChanged(player) end\nfunction cwStamina:get_stamina() end\nfunction PLUGIN:Think() end\n--- Adds.\nhook.Add('ServerOnly', 'cwStamina.x', function(a, b) end)")),
             ("plugins/stamina/cl_hooks.lua".to_string(), scan("hook.Add('Think', 'x', function() end)")),
         ];
-        let p = build(files, BuildOptions { title: Some("Flux"), ..BuildOptions::new(&layout, &meta) });
+        let p = build(placed(&layout, files), BuildOptions { title: Some("Flux"), ..BuildOptions::new(&layout, &meta) });
         let modules = &p.sections[0].groups[0].modules;
         let ids: Vec<&str> = modules.iter().map(|m| m.id.as_str()).collect();
         assert_eq!(ids, vec!["Hooks", "GM", "cw.core", "Player"]);
@@ -1560,7 +1625,7 @@ mod tests {
         let layout = Layout::default_for("Flux");
         let meta = HashMap::new();
         let files = files.into_iter().map(|(p, src)| (p.to_string(), scan(src))).collect();
-        build(files, BuildOptions { title: Some("Flux"), ..BuildOptions::new(&layout, &meta) })
+        build(placed(&layout, files), BuildOptions { title: Some("Flux"), ..BuildOptions::new(&layout, &meta) })
     }
 
     #[test]
@@ -1655,7 +1720,7 @@ mod tests {
         let layout = Layout::default_for("Flux");
         let meta = HashMap::new();
         let files = vec![("plugins/cl_crosshair.lua".to_string(), scan("local PLUGIN = PLUGIN\nPLUGIN.name = 'Crosshair'\nPLUGIN.author = 'Mr. Meow'\nPLUGIN.description = 'Adds a crosshair.'\nfunction PLUGIN:HUDPaint() end\nhook.Add('Think', 'x', function() end)"))];
-        let p = build(files, BuildOptions { title: Some("Flux"), ..BuildOptions::new(&layout, &meta) });
+        let p = build(placed(&layout, files), BuildOptions { title: Some("Flux"), ..BuildOptions::new(&layout, &meta) });
         let group = &p.sections[0].groups[0];
         assert_eq!((group.title.as_str(), group.author.as_deref(), group.description.as_deref()), ("Crosshair", Some("Mr. Meow"), Some("Adds a crosshair.")));
         let ids: Vec<&str> = group.modules.iter().map(|m| m.id.as_str()).collect();

@@ -7,7 +7,7 @@ use std::collections::HashSet;
 use yaml_rust2::yaml::Hash;
 use yaml_rust2::{Yaml, YamlLoader};
 
-use crate::model::slugify;
+use crate::model::{file_stem, slugify};
 
 /// One component of a group path.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -30,6 +30,9 @@ pub struct GroupSpec {
     /// under the section.
     pub core: bool,
     parts: Vec<Part>,
+    /// Index in the section's `groups` of the first spec of this spec's
+    /// family; see `Placement::family`.
+    family: usize,
     /// Output directory. For paths with a `*`, the directory that the group
     /// slug is appended to.
     dir: String,
@@ -52,11 +55,27 @@ impl GroupSpec {
             });
         }
         let path = if comps.is_empty() { ".".to_string() } else { comps.join("/") };
-        Ok(GroupSpec { path, name, core, parts, dir: String::new() })
+        Ok(GroupSpec { path, name, core, parts, family: 0, dir: String::new() })
     }
 
-    fn is_pattern(&self) -> bool {
+    pub fn is_pattern(&self) -> bool {
         self.parts.iter().any(|p| !matches!(p, Part::Literal(_)))
+    }
+
+    /// For a path with a wildcard, the path with a last `*.lua` read as `*`,
+    /// so that `plugins/*` and `plugins/*.lua` share it.
+    fn family_path(&self) -> Option<String> {
+        self.is_pattern().then(|| match self.path.strip_suffix("*.lua") {
+            Some(base) => format!("{base}*"),
+            None => self.path.clone(),
+        })
+    }
+
+    /// The literal components of the path joined with `-`, to tell the
+    /// output directories of several wildcard paths in one section apart.
+    fn literal_slug(&self) -> String {
+        let literals: Vec<&str> = self.parts.iter().filter_map(|p| if let Part::Literal(l) = p { Some(l.as_str()) } else { None }).collect();
+        if literals.is_empty() { "root".to_string() } else { slugify(&literals.join("-")) }
     }
 
     /// Paths with more literal components win; `.` loses to everything.
@@ -121,6 +140,12 @@ pub struct Placement {
     /// What the `*` components matched (joined with `/`), the path of a
     /// group without a `*`, or empty for `.`.
     pub key: String,
+    /// Index in the section's `groups` of the first spec of the matching
+    /// spec's family. A `*` path and the `*.lua` path that only differs in
+    /// that last component form one family, so that a directory and a file
+    /// of the same name are one group; every other spec is its own family.
+    /// Section, family and key identify a group.
+    pub family: usize,
     pub core: bool,
     /// The group's directory in the source tree, relative to the root. For
     /// a single-file group (`plugins/*.lua`) it is the file path without
@@ -133,13 +158,8 @@ pub struct Placement {
 impl Placement {
     /// The last component of the key, used as the fallback group title.
     pub fn short_name(&self) -> &str {
-        short_name(&self.key)
+        file_stem(&self.key)
     }
-}
-
-fn short_name(path: &str) -> &str {
-    let last = path.rsplit('/').next().unwrap_or(path);
-    last.strip_suffix(".lua").unwrap_or(last)
 }
 
 /// Group metadata from a `plugin.ini`.
@@ -160,39 +180,48 @@ impl Layout {
             g.dir = dir.to_string();
             g
         };
-        Layout {
-            sections: vec![
-                SectionSpec { title: title.to_string(), groups: vec![spec(".", true, "flux")] },
-                SectionSpec { title: "Packages".to_string(), groups: vec![spec("packages/*", false, "packages")] },
-                SectionSpec { title: "Plugins".to_string(), groups: vec![spec("plugins/*", false, "plugins"), spec("plugins/*.lua", false, "plugins")] },
-            ],
+        let mut sections = vec![
+            SectionSpec { title: title.to_string(), groups: vec![spec(".", true, "flux")] },
+            SectionSpec { title: "Packages".to_string(), groups: vec![spec("packages/*", false, "packages")] },
+            SectionSpec { title: "Plugins".to_string(), groups: vec![spec("plugins/*", false, "plugins"), spec("plugins/*.lua", false, "plugins")] },
+        ];
+        for s in &mut sections {
+            assign_families(&mut s.groups);
         }
+        Layout { sections }
     }
 
     /// A layout with output directories derived from the section titles:
-    /// `<section>` for the first core group of a section and
-    /// `<section>/<group>` for the others.
+    /// `<section>` for the first core group of a section,
+    /// `<section>/<group>` for the other groups without a `*`, and
+    /// `<section>/<key>` for the groups a `*` path makes. When a section has
+    /// several `*` paths (other than a `*` and `*.lua` pair), each one's
+    /// groups go to `<section>/<path>/<key>` instead, where `<path>` is the
+    /// path's literal components joined with `-`. A directory that is taken
+    /// already gets a `-2`, `-3`, ... suffix.
     pub fn new(mut sections: Vec<SectionSpec>) -> Layout {
         let mut used: HashSet<String> = HashSet::new();
         for s in &mut sections {
-            let base = section_slug(&s.title);
-            let mut slug = base.clone();
-            let mut n = 1;
-            while !used.insert(slug.clone()) {
-                n += 1;
-                slug = format!("{base}-{n}");
-            }
+            let slug = unique_dir(&mut used, section_slug(&s.title));
+            assign_families(&mut s.groups);
+            let families = s.groups.iter().enumerate().filter(|(i, g)| g.is_pattern() && g.family == *i).count();
             let mut has_core = false;
-            for g in &mut s.groups {
-                g.dir = if g.is_pattern() {
+            for i in 0..s.groups.len() {
+                let g = &s.groups[i];
+                let dir = if g.is_pattern() && g.family != i {
+                    s.groups[g.family].dir.clone()
+                } else if g.is_pattern() && families == 1 {
                     slug.clone()
+                } else if g.is_pattern() {
+                    unique_dir(&mut used, format!("{slug}/{}", g.literal_slug()))
                 } else if g.core && !has_core {
                     has_core = true;
                     slug.clone()
                 } else {
-                    let name = g.name.as_deref().unwrap_or(if g.path == "." { "root" } else { short_name(&g.path) });
-                    format!("{slug}/{}", slugify(name))
+                    let name = g.name.as_deref().unwrap_or(if g.path == "." { "root" } else { file_stem(&g.path) });
+                    unique_dir(&mut used, format!("{slug}/{}", slugify(name)))
                 };
+                s.groups[i].dir = dir;
             }
         }
         Layout { sections }
@@ -212,7 +241,7 @@ impl Layout {
                     continue;
                 }
                 let dir = if g.is_pattern() { format!("{}/{}", g.dir, slugify(&key)) } else { g.dir.clone() };
-                best = Some((priority, Placement { section: si, group: gi, key, core: g.core, source_dir, dir }));
+                best = Some((priority, Placement { section: si, group: gi, key, family: g.family, core: g.core, source_dir, dir }));
             }
         }
         best.map(|(_, p)| p)
@@ -221,6 +250,27 @@ impl Layout {
     pub fn group(&self, p: &Placement) -> &GroupSpec {
         &self.sections[p.section].groups[p.group]
     }
+}
+
+/// Sets each group spec's family: the first spec with the same
+/// `family_path`, or the spec itself.
+fn assign_families(groups: &mut [GroupSpec]) {
+    for i in 0..groups.len() {
+        let family = groups[i].family_path();
+        groups[i].family = groups[..i].iter().position(|g| family.is_some() && g.family_path() == family).unwrap_or(i);
+    }
+}
+
+/// `base`, else `base-2`, `base-3`, ...: the first one not in `used`,
+/// ignoring case. It is added to `used`.
+fn unique_dir(used: &mut HashSet<String>, base: String) -> String {
+    let mut dir = base.clone();
+    let mut n = 1;
+    while !used.insert(dir.to_ascii_lowercase()) {
+        n += 1;
+        dir = format!("{base}-{n}");
+    }
+    dir
 }
 
 fn section_slug(title: &str) -> String {
@@ -497,9 +547,9 @@ sections:
         let l = c.layout.unwrap();
         assert_eq!(place(&l, "init.lua"), Some((0, String::new(), "all".into(), true)));
         assert_eq!(place(&l, "lib/a.lua"), Some((0, "lib".into(), "all/lib".into(), false)));
-        assert_eq!(place(&l, "lib/plugins/a/b.lua"), Some((1, "a".into(), "plugins/a".into(), false)));
+        assert_eq!(place(&l, "lib/plugins/a/b.lua"), Some((1, "a".into(), "plugins/lib-plugins/a".into(), false)));
         assert_eq!(place(&l, "lib/plugins/x/b.lua").map(|p| p.1), Some("x".into()), "ties go to the first path");
-        assert_eq!(place(&l, "lib/y/x/b.lua"), Some((1, "y".into(), "plugins/y".into(), false)));
+        assert_eq!(place(&l, "lib/y/x/b.lua"), Some((1, "y".into(), "plugins/lib-x/y".into(), false)));
     }
 
     #[test]
@@ -520,6 +570,37 @@ sections:
         let l = c.layout.unwrap();
         let dirs: Vec<String> = ["a/1.lua", "b/1.lua", "c/d.lua", "e/1.lua"].iter().map(|p| l.classify(p).unwrap().dir).collect();
         assert_eq!(dirs, vec!["core-stuff", "core-stuff/b", "core-stuff/d", "core-stuff-2"]);
+    }
+
+    #[test]
+    fn gives_every_group_spec_its_own_directory() {
+        let c = Config::from_yaml(
+            "sections:
+  - title: Plugins
+    groups:
+      - path: gamemodes/a/plugins/*
+      - path: gamemodes/a/plugins/*.lua
+      - path: gamemodes/b/plugins/*
+      - { path: extra/x, name: Stamina }
+      - { path: more/x, name: stamina }
+  - title: Other
+    groups:
+      - path: lib/*
+      - { path: misc/stamina, name: stamina }
+",
+        )
+        .unwrap();
+        let l = c.layout.unwrap();
+        let dirs: Vec<String> = ["gamemodes/a/plugins/stamina/sh_plugin.lua", "gamemodes/a/plugins/stamina.lua", "gamemodes/b/plugins/stamina/sh_plugin.lua", "extra/x/a.lua", "more/x/a.lua", "lib/stamina/a.lua", "misc/stamina/a.lua"]
+            .iter()
+            .map(|p| l.classify(p).unwrap().dir)
+            .collect();
+        assert_eq!(
+            dirs,
+            vec!["plugins/gamemodes-a-plugins/stamina", "plugins/gamemodes-a-plugins/stamina", "plugins/gamemodes-b-plugins/stamina", "plugins/Stamina", "plugins/stamina-2", "other/stamina", "other/stamina"]
+        );
+        let families: Vec<usize> = ["gamemodes/a/plugins/s/a.lua", "gamemodes/a/plugins/s.lua", "gamemodes/b/plugins/s/a.lua", "extra/x/a.lua"].iter().map(|p| l.classify(p).unwrap().family).collect();
+        assert_eq!(families, vec![0, 0, 2, 3], "a `*` path and its `*.lua` path form one family");
     }
 
     #[test]
