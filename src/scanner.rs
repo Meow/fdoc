@@ -142,6 +142,9 @@ pub struct FileScan {
     pub spec: Vec<(String, String)>,
     /// Top-level `local NAME = <expr>` declarations, except metatable aliases.
     pub locals: Vec<LocalTable>,
+    /// Every name a `local` statement declares, at any depth: variables
+    /// (`local a, b = ...`) and `local function` names.
+    pub local_names: Vec<String>,
     /// Hook calls with a string literal name (see `HOOK_CALLERS`).
     pub hook_calls: Vec<HookCall>,
     /// `hook.Add` calls with a string literal name.
@@ -347,6 +350,11 @@ pub fn scan(src: &str) -> FileScan {
                     continue;
                 }
                 "local" => {
+                    for name in local_names(&toks, i) {
+                        if !s.out.local_names.contains(&name) {
+                            s.out.local_names.push(name);
+                        }
+                    }
                     // `local x = FindMetaTable('Y')`, `local function`, `local x = <expr>`.
                     if let Some((alias, target)) = parse_meta_alias(&toks, i) {
                         s.out.meta_aliases.push((alias, target));
@@ -633,6 +641,28 @@ fn parse_meta_alias(toks: &[Token], i: usize) -> Option<(String, String)> {
 }
 
 /// `local NAME = ...` -> (NAME, index of the first token of the right-hand side).
+/// The names the `local` statement at `i` declares: `local function f`
+/// gives `f`, `local a, b <const> = ...` gives `a` and `b`.
+fn local_names(toks: &[Token], i: usize) -> Vec<String> {
+    if toks.get(i + 1).is_some_and(|t| t.is_name("function")) {
+        return toks.get(i + 2).and_then(|t| t.name()).filter(|n| !is_keyword(n)).map(|n| vec![n.to_string()]).unwrap_or_default();
+    }
+    let mut names = Vec::new();
+    let mut j = i + 1;
+    while let Some(name) = toks.get(j).and_then(|t| t.name()).filter(|n| !is_keyword(n)) {
+        names.push(name.to_string());
+        j += 1;
+        if toks.get(j).is_some_and(|t| t.is_sym("<")) {
+            j += 3;
+        }
+        if !toks.get(j).is_some_and(|t| t.is_sym(",")) {
+            break;
+        }
+        j += 1;
+    }
+    names
+}
+
 fn parse_local(toks: &[Token], i: usize) -> Option<(String, usize)> {
     let name = toks.get(i + 1)?.name()?;
     if is_keyword(name) || !toks.get(i + 2)?.is_sym("=") || toks.get(i + 3).is_none_or(|t| matches!(t.tok, Tok::Comment { .. })) {
@@ -1198,6 +1228,7 @@ end
         assert!(scan.hook_calls[2].doc.is_none());
         assert!(scan.file_doc.is_none(), "the block belongs to the hook call");
         assert_eq!(scan.functions.len(), 2, "the local function stays private");
+        assert_eq!(scan.local_names, vec!["loadout", "helper", "c", "d"], "locals at any depth");
     }
 
     #[test]

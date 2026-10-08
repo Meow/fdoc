@@ -138,8 +138,11 @@ free functions are listed under `Globals`.
   `Plugin.call`, `cw.plugin:Call`, ...) gets a `Hooks` page that defines
   them, with one entry per hook name: the arguments of its widest call,
   the functions that call it and every call site. The doc comment above a
-  call documents the hook; without `@param` tags, the call's arguments are
-  listed as the expressions they are.
+  call documents the hook, else the doc comment of the `GM`, then the
+  `Schema` handler of the same name in the group; without `@param` tags,
+  the call's arguments are listed as the expressions they are. Callers
+  that are functions on a local or a `self` field (`label.DoClick`) cannot
+  be linked and are left out; their call sites are still listed.
 - **Hook handlers.** `GM`, `Schema` and the plugin table (`PLUGIN`, shown under
   the name given to `PLUGIN:set_global` if any) get their own pages, badged
   `gamemode`, `schema` and `plugin`. Their PascalCase methods are listed as
@@ -152,7 +155,9 @@ free functions are listed under `Globals`.
   `local COMMAND = cw.command:New('A')` gets a page of its own. It is named by
   `@module`, `vgui.Register`, the constructor's string argument, a
   `PrintName` / `name` field, or else after the file's library
-  (`cw.currency.Class`). Aliases such as `local PLUGIN = PLUGIN` are not
+  (`cw.currency.Class`). A name with spaces is the page's title, and its
+  words are joined for the id (`cw.system:New('Manage Players')` is
+  `ManagePlayers`); references can use either. Aliases such as `local PLUGIN = PLUGIN` are not
   objects. Template objects that the loader injects (`PANEL`, `TOOL`, `ITEM`,
   `ENT`, ...) get one page per file, and an entity, weapon or effect folder
   (`init.lua`, `cl_init.lua`, `shared.lua`) gets one page named after the
@@ -167,7 +172,10 @@ free functions are listed under `Globals`.
   differ, both are shown, the client's under "On the client".
 
 A file's doc comment documents the module its `@module` names, else the
-library it declares, else the only module its functions are in.
+library it declares, else the only module its functions are in. Without
+`@module`, a server or client file documents a module only when all of the
+module's functions are in that file, so the client half of a module does
+not describe the whole. `sh_` files win over the others.
 
 Local functions are private and never documented.
 
