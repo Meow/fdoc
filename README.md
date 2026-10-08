@@ -172,6 +172,21 @@ free functions are listed under `Globals`.
   `ENT`, ...) get one page per file, and an entity, weapon or effect folder
   (`init.lua`, `cl_init.lua`, `shared.lua`) gets one page named after the
   folder.
+- **Definitions.** Objects that the framework loads from their own file,
+  such as commands, items, factions, classes, roles, attributes, conditions,
+  entities, weapons, effects, tools, panels, themes and skins, are
+  definitions rather than code. Every template object is one, labelled after
+  its name (`CMD` is a `Command`, `ENT` an `Entity`, `SWEP` a `Weapon`), and
+  so is a file-local object named like one (`local PANEL = {}`,
+  `local COMMAND = ...`, `local CLASS = ...`) or, failing that, an all-caps
+  local created by a constructor call on a library, labelled after the
+  library (`local SYSTEM = cw.system:New('A')` is a `System`). Other tables,
+  such as `local CLASS_TABLE = {}`, and `setmetatable(...)` stay code. In the
+  sidebar, on a group's index page and on the project index, a group lists
+  its code modules first, then its definitions under a heading per kind
+  (`Commands`, `Items`, `Entities`, ...). A definition is badged with its
+  label (`command`, `entity`), and its page says where it is defined
+  (`Command defined in commands/sh_kick.lua`).
 - **Realms.** Each function is marked server (blue), client (orange) or
   shared (both), from `@realm`, then `if SERVER` / `if CLIENT` blocks, then
   the file name. The marker is shown in the summary, the details, the

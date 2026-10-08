@@ -73,6 +73,21 @@
       '<div class="sidebar-row"><a href="' + escapeHtml(pageUrl(group.d, m.s)) + '">' + escapeHtml(m.t) + '</a></div></li>';
   }
 
+  // A group's modules: code first, then each kind of definition under a
+  // heading (`k` is the kind's plural label, such as "Commands").
+  function modulesHtml(group) {
+    var html = '';
+    var kind = '';
+    group.m.forEach(function (m) {
+      if (m.k && m.k !== kind) {
+        kind = m.k;
+        html += '<li class="sidebar-heading">' + escapeHtml(kind) + '</li>';
+      }
+      html += moduleHtml(group, m);
+    });
+    return html;
+  }
+
   function renderTabs() {
     if (!tabs) return;
     tabs.innerHTML = items.map(function (section, i) {
@@ -93,13 +108,13 @@
     var html = '<ul>';
     items[index].g.forEach(function (group) {
       if (group.core) {
-        group.m.forEach(function (m) { html += moduleHtml(group, m); });
+        html += modulesHtml(group);
         return;
       }
       html += '<li class="sidebar-item sidebar-group' + (openGroups[group.d] ? ' open' : '') + '" data-group="' + escapeHtml(group.d) + '">' +
         '<div class="sidebar-row"><a href="' + escapeHtml(docsRoot + group.d + '/index.html') + '">' + escapeHtml(group.t) + '</a>' +
         '<button type="button" class="chevron" aria-label="Toggle"></button></div><ul>';
-      group.m.forEach(function (m) { html += moduleHtml(group, m); });
+      html += modulesHtml(group);
       html += '</ul></li>';
     });
     html += '</ul>';

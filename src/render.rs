@@ -122,16 +122,18 @@ fn layout(project: &Project, path: &str, title: &str, active: Active, body: &str
 }
 
 /// The navigation tree shared by every page: sections, groups and modules.
+/// A group's code modules come first, then its definitions by kind, each
+/// with the kind's plural label (`k`).
 fn sidebar_items(project: &Project) -> String {
     let mut sections = Vec::new();
     for section in &project.sections {
         let mut groups = Vec::new();
         for group in &section.groups {
-            let modules: Vec<String> = group
-                .modules
-                .iter()
-                .map(|m| format!("{{\"t\":{},\"s\":{}}}", json_str(&m.title), json_str(&m.slug)))
-                .collect();
+            let code = group.code_modules().map(|m| format!("{{\"t\":{},\"s\":{}}}", json_str(&m.title), json_str(&m.slug)));
+            let definitions = group.definitions().into_iter().flat_map(|(label, modules)| {
+                modules.into_iter().map(move |m| format!("{{\"t\":{},\"s\":{},\"k\":{}}}", json_str(&m.title), json_str(&m.slug), json_str(&label)))
+            });
+            let modules: Vec<String> = code.chain(definitions).collect();
             groups.push(format!(
                 "{{\"t\":{},\"d\":{},\"core\":{},\"m\":[{}]}}",
                 json_str(&group.title),
@@ -247,21 +249,23 @@ fn project_index(project: &Project) -> String {
         body.push_str(&md(project, &root, d));
     }
 
-    let total_modules: usize = project.all_modules().count();
+    let total_definitions: usize = project.all_modules().filter(|(_, m)| m.definition.is_some()).count();
+    let total_modules: usize = project.all_modules().count() - total_definitions;
     let total_functions: usize = project.all_modules().map(|(_, m)| m.functions.len()).sum();
     let documented: usize = project.all_modules().map(|(_, m)| m.functions.iter().filter(|f| f.doc.is_some()).count()).sum();
-    let _ = writeln!(body, "<p class=\"stats\">{total_modules} modules · {total_functions} functions · {documented} documented</p>");
+    let _ = writeln!(body, "<p class=\"stats\">{} · {total_functions} functions · {documented} documented</p>", module_counts(total_modules, total_definitions));
 
     for section in &project.sections {
         let _ = writeln!(body, "<section class=\"overview-section\"><h2>{}</h2>", esc(&section.title));
         for group in &section.groups {
             if group.is_core {
-                body.push_str(&module_list(project, &root, group));
+                body.push_str(&module_lists(project, &root, group, None, "h3"));
             } else {
-                let _ = writeln!(body, "<div class=\"summary-row\"><div class=\"summary-signature\"><a href=\"{dir}/index.html\">{title}</a> <span class=\"muted\">{n} modules</span></div><div class=\"summary-synopsis\">{desc}</div></div>",
+                let definitions = group.modules.iter().filter(|m| m.definition.is_some()).count();
+                let _ = writeln!(body, "<div class=\"summary-row\"><div class=\"summary-signature\"><a href=\"{dir}/index.html\">{title}</a> <span class=\"muted\">{counts}</span></div><div class=\"summary-synopsis\">{desc}</div></div>",
                     dir = group.dir,
                     title = esc(&group.title),
-                    n = group.modules.len(),
+                    counts = module_counts(group.modules.len() - definitions, definitions),
                     desc = group.description.as_deref().map(|d| md_inline(project, &root, &summary_of(d))).unwrap_or_default(),
                 );
             }
@@ -271,14 +275,54 @@ fn project_index(project: &Project) -> String {
     layout(project, path, &project.title, Active::default(), &body)
 }
 
-fn module_list(project: &Project, root: &str, group: &Group) -> String {
+/// `3 modules · 2 definitions`, leaving out a zero count of either unless
+/// both are zero.
+fn module_counts(modules: usize, definitions: usize) -> String {
+    let count = |n: usize, word: &str| format!("{n} {word}{}", if n == 1 { "" } else { "s" });
+    match (modules, definitions) {
+        (_, 0) => count(modules, "module"),
+        (0, _) => count(definitions, "definition"),
+        _ => format!("{} · {}", count(modules, "module"), count(definitions, "definition")),
+    }
+}
+
+/// The badge of a module: its kind, or for a definition its label, coloured
+/// like an object.
+fn badge(m: &Module) -> String {
+    let text = esc(&m.badge());
+    match m.definition {
+        Some(_) => format!("<span class=\"badge badge-object badge-definition\">{text}</span>"),
+        None => format!("<span class=\"badge badge-{text}\">{text}</span>"),
+    }
+}
+
+/// A group's code modules, under `code_heading` when given, then its
+/// definitions under a `heading` per kind (`<h2>Commands</h2>`). Empty
+/// lists are left out.
+fn module_lists(project: &Project, root: &str, group: &Group, code_heading: Option<&str>, heading: &str) -> String {
+    let mut out = String::new();
+    let code: Vec<&Module> = group.code_modules().collect();
+    if !code.is_empty() {
+        if let Some(title) = code_heading {
+            let _ = writeln!(out, "<{heading}>{}</{heading}>", esc(title));
+        }
+        out.push_str(&module_list(project, root, group, &code));
+    }
+    for (label, modules) in group.definitions() {
+        let _ = writeln!(out, "<{heading}>{}</{heading}>", esc(&label));
+        out.push_str(&module_list(project, root, group, &modules));
+    }
+    out
+}
+
+fn module_list(project: &Project, root: &str, group: &Group, modules: &[&Module]) -> String {
     let mut out = String::from("<div class=\"module-list\">\n");
-    for m in &group.modules {
-        let _ = writeln!(out, "<div class=\"summary-row\"><div class=\"summary-signature\"><a href=\"{root}{dir}/{slug}.html\">{title}</a> <span class=\"badge badge-{badge}\">{badge}</span>{env}</div><div class=\"summary-synopsis\">{desc}</div></div>",
+    for m in modules {
+        let _ = writeln!(out, "<div class=\"summary-row\"><div class=\"summary-signature\"><a href=\"{root}{dir}/{slug}.html\">{title}</a> {badge}{env}</div><div class=\"summary-synopsis\">{desc}</div></div>",
             dir = group.dir,
             slug = m.slug,
             title = esc(&m.title),
-            badge = m.kind.badge(),
+            badge = badge(m),
             env = m.environment().map(environment_flag).unwrap_or_default(),
             desc = md_inline(project, root, &m.summary()),
         );
@@ -306,8 +350,7 @@ fn group_index(project: &Project, group: &Group) -> String {
     if let Some(a) = &group.author {
         let _ = writeln!(body, "<p class=\"muted\">By {}</p>", esc(a));
     }
-    body.push_str("<h2>Modules</h2>\n");
-    body.push_str(&module_list(project, &root, group));
+    body.push_str(&module_lists(project, &root, group, Some("Modules"), "h2"));
     layout(project, &path, &group.title, Active { group_dir: Some(&group.dir), module_slug: None }, &body)
 }
 
@@ -318,9 +361,9 @@ fn module_page(project: &Project, group: &Group, m: &Module) -> String {
 
     let _ = write!(
         body,
-        "<div class=\"page-header\"><h1>{} <span class=\"badge badge-{badge}\">{badge}</span>{realm}{env}</h1>",
+        "<div class=\"page-header\"><h1>{} {badge}{realm}{env}</h1>",
         esc(&m.title),
-        badge = m.kind.badge(),
+        badge = badge(m),
         realm = module_realm(m).map(realm_pill).unwrap_or_default(),
         env = m.environment().map(environment_flag).unwrap_or_default(),
     );
@@ -716,7 +759,7 @@ fn search_data(project: &Project) -> String {
             }
             for m in &group.modules {
                 let page = format!("{}/{}.html", group.dir, m.slug);
-                items.push(entry(&m.title, m.kind.badge(), &page, &m.summary(), &group.title, None));
+                items.push(entry(&m.title, &m.badge(), &page, &m.summary(), &group.title, None));
                 for f in &m.functions {
                     let kind = match f.kind {
                         FunctionKind::Declared => "function",
@@ -892,5 +935,45 @@ end",
         assert!(seed.contains("<p class=\"admonition-title\">Production only</p><p>Skipped when <code>SEED</code> is set.</p>"), "{seed}");
         let index = page("index.html");
         assert!(index.contains("Seed</a> <span class=\"badge badge-library\">library</span> <span class=\"flag flag-environment\" title=\"Production only\">production</span></div>"), "{index}");
+    }
+
+    #[test]
+    fn lists_definitions_after_code_modules() {
+        let files = vec![
+            ("lib/sh_a.lua".to_string(), scan("function A.x() end")),
+            ("lib/commands/sh_ping.lua".to_string(), scan("CMD.name = 'Ping'\nfunction CMD:on_run() end")),
+            ("plugins/admin/plugin/sh_plugin.lua".to_string(), scan("PLUGIN:set_name('Admin')\nfunction Bolt.x() end")),
+            ("plugins/admin/plugin/commands/sh_addbots.lua".to_string(), scan("CMD.name = 'AddBots'\nfunction CMD:on_run() end")),
+            ("plugins/admin/plugin/commands/sh_kick.lua".to_string(), scan("CMD.name = 'Kick'\nfunction CMD:on_run() end")),
+        ];
+        let layout = Layout::default_for("Test");
+        let meta = HashMap::new();
+        let project = build(placed(&layout, files), BuildOptions { title: Some("Test"), ..BuildOptions::new(&layout, &meta) });
+        let pages = render_all(&project);
+        let page = |path: &str| pages.iter().find(|p| p.path == path).map(|p| p.content.as_str()).unwrap_or_else(|| panic!("no page {path}"));
+
+        let admin = page("plugins/admin/index.html");
+        let modules = admin.find("<h2>Modules</h2>").expect(admin);
+        let commands = admin.find("<h2>Commands</h2>").expect(admin);
+        assert!(modules < commands, "{admin}");
+        assert!(admin[modules..commands].contains("Bolt</a> <span class=\"badge badge-library\">library</span>"), "{admin}");
+        assert!(!admin[modules..commands].contains("AddBots"), "{admin}");
+        let listed = &admin[commands..];
+        assert!(listed.find("AddBots</a> <span class=\"badge badge-object badge-definition\">command</span>").unwrap() < listed.find("Kick</a>").unwrap(), "{listed}");
+
+        let addbots = page("plugins/admin/sh_addbots.html");
+        assert!(addbots.contains("<h1>AddBots <span class=\"badge badge-object badge-definition\">command</span>"), "{addbots}");
+        assert!(addbots.contains("<p class=\"subtitle\">Command defined in plugin/commands/sh_addbots.lua</p>"), "{addbots}");
+
+        let index = page("index.html");
+        assert!(index.contains("<h3>Commands</h3>"), "{index}");
+        assert!(index.find("A</a> <span class=\"badge badge-library\">").unwrap() < index.find("<h3>Commands</h3>").unwrap(), "{index}");
+        assert!(index.contains("<span class=\"muted\">1 module · 2 definitions</span>"), "{index}");
+        assert!(index.contains("<p class=\"stats\">2 modules · 3 definitions"), "{index}");
+
+        let items = page("assets/sidebar_items.js");
+        assert!(items.contains("{\"t\":\"AddBots\",\"s\":\"sh_addbots\",\"k\":\"Commands\"},{\"t\":\"Kick\",\"s\":\"sh_kick\",\"k\":\"Commands\"}]"), "{items}");
+        let data = page("assets/search_data.js");
+        assert!(data.contains("{\"t\":\"AddBots\",\"k\":\"command\""), "{data}");
     }
 }

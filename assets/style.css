@@ -253,6 +253,11 @@ th { background: var(--code-background); }
 .sidebar-functions ul a { font-family: var(--mono); font-size: 0.86em; padding-left: 3.3em !important; font-weight: 400 !important; color: var(--sidebar-text) !important; }
 .sidebar-group .sidebar-functions ul a { padding-left: 4.3em !important; }
 .sidebar-functions ul a:hover { color: var(--main) !important; }
+.sidebar-heading {
+  padding: 1.1em 1.2em 0.25em calc(1.2em / 0.7); margin: 0; font-size: 0.7em; font-weight: 600; letter-spacing: 0.06em;
+  text-transform: uppercase; color: var(--text-light); cursor: default; user-select: none;
+}
+.sidebar-group > ul > .sidebar-heading { padding-left: calc(2.2em / 0.7); }
 .sidebar-section-title { padding: 1.2em 1.2em 0.3em; font-size: 0.74em; letter-spacing: 0.06em; text-transform: uppercase; color: var(--text-light); font-weight: 600; }
 .sidebar-noscript { padding: 0.5em 1.4em; }
 

@@ -8,10 +8,33 @@ use crate::layout::{GroupMeta, Layout, Placement};
 use crate::scanner::{path_realm, Category, FileScan, FunctionDecl, Sep};
 
 /// Template objects that the loader injects as globals and redefines per
-/// file (`PANEL:Init`, `ENT:Think`, ...), so each file becomes its own module.
-/// Objects declared as file locals are recognised from the declaration
-/// instead, see `is_object_init`.
-const PER_FILE_OBJECTS: [&str; 14] = ["PANEL", "CMD", "SKIN", "THEME", "TOOL", "ENT", "SWEP", "EFFECT", "ROLE", "PACKAGE", "ITEM", "ATTRIBUTE", "FACTION", "CONDITION"];
+/// file (`PANEL:Init`, `ENT:Think`, ...), so each file becomes its own module,
+/// with the definition label of each. Objects declared as file locals are
+/// recognised from the declaration instead, see `is_object_init`.
+const PER_FILE_OBJECTS: [(&str, &str); 14] = [
+    ("PANEL", "Panel"),
+    ("CMD", "Command"),
+    ("SKIN", "Skin"),
+    ("THEME", "Theme"),
+    ("TOOL", "Tool"),
+    ("ENT", "Entity"),
+    ("SWEP", "Weapon"),
+    ("EFFECT", "Effect"),
+    ("ROLE", "Role"),
+    ("PACKAGE", "Package"),
+    ("ITEM", "Item"),
+    ("ATTRIBUTE", "Attribute"),
+    ("FACTION", "Faction"),
+    ("CONDITION", "Condition"),
+];
+
+/// Template-style local names that make a definition besides those of
+/// `PER_FILE_OBJECTS`, such as `local COMMAND = cw.command:New('A')`.
+const LOCAL_DEFINITIONS: [(&str, &str); 2] = [("COMMAND", "Command"), ("CLASS", "Class")];
+
+/// Plural definition labels in the order they are listed in; others follow
+/// alphabetically.
+const DEFINITION_ORDER: [&str; 15] = ["Commands", "Items", "Factions", "Classes", "Roles", "Attributes", "Conditions", "Entities", "Weapons", "Effects", "Tools", "Panels", "Themes", "Skins", "Packages"];
 
 /// File names of an entity, weapon or effect folder; the files of one folder
 /// form one module.
@@ -51,6 +74,30 @@ pub enum ModuleKind {
     /// A per-file template object such as a `PANEL`, or a file-local object
     /// table; `object` is the name it is written as in the code.
     Object { object: String },
+}
+
+/// The definition label of a per-file template object (`CMD` -> `Command`).
+fn per_file_label(object: &str) -> Option<&'static str> {
+    PER_FILE_OBJECTS.iter().find(|(o, _)| *o == object).map(|(_, label)| *label)
+}
+
+/// The plural of a definition label: `Entity` -> `Entities`, `Class` ->
+/// `Classes`, `Command` -> `Commands`.
+fn plural(label: &str) -> String {
+    if let Some(stem) = label.strip_suffix('y').filter(|s| !s.ends_with(['a', 'e', 'i', 'o', 'u'])) {
+        format!("{stem}ies")
+    } else if label.ends_with('s') || label.ends_with('x') || label.ends_with("ch") || label.ends_with("sh") {
+        format!("{label}es")
+    } else {
+        format!("{label}s")
+    }
+}
+
+/// Sort key of a plural definition label: the known labels in
+/// `DEFINITION_ORDER`, then the others alphabetically.
+fn definition_rank(plural: &str) -> (usize, String) {
+    let known = DEFINITION_ORDER.iter().position(|p| *p == plural).unwrap_or(DEFINITION_ORDER.len());
+    (known, plural.to_ascii_lowercase())
 }
 
 impl ModuleKind {
@@ -170,9 +217,22 @@ pub struct Module {
     pub functions: Vec<Function>,
     pub files: Vec<String>,
     pub decl_file: Option<(String, usize)>,
+    /// What the module defines when it is a definition rather than code:
+    /// a template object or file-local object that the framework loads
+    /// from its own file, such as a `Command` or an `Entity`.
+    pub definition: Option<String>,
 }
 
 impl Module {
+    /// The badge text: the definition label in lower case (`command`),
+    /// else the kind's badge.
+    pub fn badge(&self) -> String {
+        match &self.definition {
+            Some(label) => label.to_lowercase(),
+            None => self.kind.badge().to_string(),
+        }
+    }
+
     /// Functions grouped by category, in category order.
     pub fn grouped(&self) -> Vec<(&Category, Vec<&Function>)> {
         self.categories.iter().map(|c| (c, self.functions.iter().filter(|f| f.category == c.name).collect::<Vec<_>>())).filter(|(_, fs)| !fs.is_empty()).collect()
@@ -200,6 +260,32 @@ pub struct Group {
     pub modules: Vec<Module>,
     /// Core groups have no index page of their own.
     pub is_core: bool,
+}
+
+impl Group {
+    /// The modules that are code rather than definitions, in module order.
+    pub fn code_modules(&self) -> impl Iterator<Item = &Module> {
+        self.modules.iter().filter(|m| m.definition.is_none())
+    }
+
+    /// The definition modules by plural label (`Commands`), in definition
+    /// order, each sorted by title, then id.
+    pub fn definitions(&self) -> Vec<(String, Vec<&Module>)> {
+        let mut kinds: BTreeMap<(usize, String), (String, Vec<&Module>)> = BTreeMap::new();
+        for m in &self.modules {
+            if let Some(label) = &m.definition {
+                let label = plural(label);
+                kinds.entry(definition_rank(&label)).or_insert_with(|| (label, Vec::new())).1.push(m);
+            }
+        }
+        kinds
+            .into_values()
+            .map(|(label, mut modules)| {
+                modules.sort_by(|a, b| a.title.to_lowercase().cmp(&b.title.to_lowercase()).then_with(|| a.id.cmp(&b.id)));
+                (label, modules)
+            })
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -571,14 +657,31 @@ fn object_word(local: &str) -> String {
     name.split('_').map(|part| capitalize(&part.to_ascii_lowercase())).collect()
 }
 
-/// What an entity-style folder holds, by the object its files define.
-fn entity_label(object: &str) -> String {
-    match object {
-        "ENT" => "Entity".to_string(),
-        "SWEP" => "Weapon".to_string(),
-        "EFFECT" => "Effect".to_string(),
-        other => other.to_string(),
+/// The definition label of a file-local object, if it is a definition: a
+/// template-style local named after a template (`local PANEL = {}`,
+/// `local COMMAND = ...`), else one created by a constructor call on a
+/// library, labelled after the library (`cw.system:New('A')` -> `System`).
+/// Other tables, `setmetatable(...)` and other calls are code.
+fn local_definition(name: &str, init: &str) -> Option<String> {
+    if name.chars().any(|c| c.is_ascii_lowercase()) {
+        return None;
     }
+    if let Some(label) = per_file_label(name).or_else(|| LOCAL_DEFINITIONS.iter().find(|(o, _)| *o == name).map(|(_, label)| *label)) {
+        return Some(label.to_string());
+    }
+    let (path, args) = split_call(init.trim())?;
+    let p = path.rfind(['.', ':'])?;
+    if !is_whole_call(args) || !is_constructor_name(&path[p + 1..]) {
+        return None;
+    }
+    let library = path[..p].rsplit('.').next()?;
+    if library.is_empty() || !library.chars().all(|c| c.is_ascii_lowercase()) {
+        return None;
+    }
+    // `local BLUEPRINT = cw.blueprints:New()` is a `Blueprint`.
+    let own = name.to_ascii_lowercase();
+    let word = if library.strip_suffix('s') == Some(own.as_str()) { own.as_str() } else { library };
+    Some(capitalize(word))
 }
 
 /// True when the descriptions of two doc blocks match, ignoring `@realm`
@@ -605,11 +708,12 @@ struct Target {
     kind: ModuleKind,
     doc: Option<DocBlock>,
     decl_file: Option<(String, usize)>,
+    definition: Option<String>,
 }
 
 impl Target {
     fn new(key: String, id: String, kind: ModuleKind) -> Target {
-        Target { key, title: id.clone(), id, subtitle: None, kind, doc: None, decl_file: None }
+        Target { key, title: id.clone(), id, subtitle: None, kind, doc: None, decl_file: None, definition: None }
     }
 
     fn into_module(self) -> Module {
@@ -618,6 +722,7 @@ impl Target {
         m.subtitle = self.subtitle;
         m.doc = self.doc;
         m.decl_file = self.decl_file;
+        m.definition = self.definition;
         m
     }
 }
@@ -657,7 +762,7 @@ fn plugin_tables(gb: &GroupBuilder) -> HashSet<String> {
     gb.files
         .iter()
         .flat_map(|(_, scan)| &scan.fields)
-        .filter(|(owner, field, _)| field == "author" && !owner.contains('.') && !PER_FILE_OBJECTS.contains(&owner.as_str()))
+        .filter(|(owner, field, _)| field == "author" && !owner.contains('.') && per_file_label(owner).is_none())
         .map(|(owner, _, _)| owner.clone())
         .collect()
 }
@@ -709,14 +814,20 @@ fn local_objects(path: &str, rel: &str, scan: &FileScan, documented_only: bool) 
                 (id, title)
             }
         };
+        let definition = local_definition(&local.name, &local.init);
+        let subtitle = match &definition {
+            Some(label) => format!("{label} defined in {rel}"),
+            None => format!("Object table {} in {rel}", local.name),
+        };
         out[i] = Some(Target {
             key: format!("\u{2}object\u{0}{path}\u{0}{i:06}"),
             id,
             title,
-            subtitle: Some(format!("Object table {} in {rel}", local.name)),
+            subtitle: Some(subtitle),
             kind: ModuleKind::Object { object: local.name.clone() },
             doc: local.doc.clone(),
             decl_file: Some((path.to_string(), local.line)),
+            definition,
         });
     }
     out
@@ -732,7 +843,7 @@ fn owner_target(gb: &GroupBuilder, group_title: &str, path: &str, scan: &FileSca
         t.subtitle = Some(format!("Global functions of {group_title}"));
         return t;
     }
-    if PER_FILE_OBJECTS.contains(&first) {
+    if let Some(label) = per_file_label(first) {
         let kind = ModuleKind::Object { object: first.to_string() };
         let file = path.rsplit('/').next().unwrap_or(path);
         if ENTITY_FILES.contains(&file)
@@ -741,13 +852,15 @@ fn owner_target(gb: &GroupBuilder, group_title: &str, path: &str, scan: &FileSca
             let folder = &path[..path.len() - file.len() - 1];
             let mut t = Target::new(format!("\u{2}entity\u{0}{first}\u{0}{folder}"), dir.to_string(), kind);
             t.title = title_field(scan, first).unwrap_or_else(|| dir.to_string());
-            t.subtitle = Some(entity_label(first));
+            t.subtitle = Some(format!("{label} defined in {}", rel_path(gb, folder)));
+            t.definition = Some(label.to_string());
             return t;
         }
         let id = if first == "PANEL" { scan.vgui_name.clone().unwrap_or_else(|| file_stem(path).to_string()) } else { file_stem(path).to_string() };
         let mut t = Target::new(format!("\u{2}file\u{0}{first}\u{0}{path}"), id.clone(), kind);
         t.title = title_field(scan, first).unwrap_or(id);
-        t.subtitle = Some(format!("Object {first} in {rel}"));
+        t.subtitle = Some(format!("{label} defined in {rel}"));
+        t.definition = Some(label.to_string());
         return t;
     }
     if let Some(object) = handler_object(&f.owner, owner, &gb.plugin_global, plugin_tables) {
@@ -1214,7 +1327,7 @@ fn is_local_caller(caller: &str, locals: Option<&HashSet<&str>>) -> bool {
 }
 
 fn new_module(id: &str, kind: ModuleKind) -> Module {
-    Module { id: id.to_string(), title: id.to_string(), subtitle: None, slug: slugify(id), kind, doc: None, categories: Vec::new(), functions: Vec::new(), files: Vec::new(), decl_file: None }
+    Module { id: id.to_string(), title: id.to_string(), subtitle: None, slug: slugify(id), kind, doc: None, categories: Vec::new(), functions: Vec::new(), files: Vec::new(), decl_file: None, definition: None }
 }
 
 fn build_index(project: &Project) -> HashMap<String, String> {
@@ -1511,7 +1624,8 @@ mod tests {
         assert_eq!(anchors, vec!["Twice", "Twice-2"]);
 
         let item = module(&modules, "cw_item");
-        assert_eq!((item.title.as_str(), item.subtitle.as_deref()), ("Item", Some("Entity")));
+        assert_eq!((item.title.as_str(), item.subtitle.as_deref()), ("Item", Some("Entity defined in entities/entities/cw_item")));
+        assert_eq!(item.definition.as_deref(), Some("Entity"));
         assert_eq!(item.files.len(), 3);
         let table = &get("cw_item", "GetItemTable")[0];
         assert_eq!((table.realm, table.file.as_str(), table.summary().as_str()), (Realm::Shared, "entities/entities/cw_item/shared.lua", "Shared."));
@@ -1659,12 +1773,14 @@ if c then function split() end else function Other.split() end end",
             ("items/c/box.lua", "function ITEM:OnUse() end"),
         ]);
         let hands = module(&modules, "cw_hands");
-        assert_eq!((hands.title.as_str(), hands.subtitle.as_deref()), ("Hands", Some("Weapon")));
-        assert_eq!(module(&modules, "blood").subtitle.as_deref(), Some("Effect"));
+        assert_eq!((hands.title.as_str(), hands.subtitle.as_deref(), hands.definition.as_deref()), ("Hands", Some("Weapon defined in entities/weapons/cw_hands"), Some("Weapon")));
+        assert_eq!(module(&modules, "blood").subtitle.as_deref(), Some("Effect defined in entities/effects/blood"));
         assert_eq!(module(&modules, "cw_baton").title, "Stun baton");
         let boxes: Vec<(&str, &str)> = modules.iter().filter(|m| m.id.contains("box")).map(|m| (m.id.as_str(), m.title.as_str())).collect();
         assert_eq!(boxes, vec![("box", "box"), ("sh_box", "Box"), ("sh_box-b", "sh_box (b)")]);
-        assert_eq!(module(&modules, "sh_box").subtitle.as_deref(), Some("Object ITEM in items/a/sh_box.lua"));
+        assert_eq!(module(&modules, "sh_box").subtitle.as_deref(), Some("Item defined in items/a/sh_box.lua"));
+        assert_eq!(module(&modules, "sh_box").definition.as_deref(), Some("Item"));
+        assert_eq!(module(&modules, "sh_box").badge(), "item");
     }
 
     #[test]
@@ -1845,5 +1961,67 @@ if c then function split() end else function Other.split() end end",
         let ids: Vec<&str> = group.modules.iter().map(|m| m.id.as_str()).collect();
         assert_eq!(ids, vec!["PLUGIN"], "hook.Add in a plugin file goes to the plugin");
         assert_eq!(group.modules[0].functions[0].realm, Realm::Client);
+    }
+
+    #[test]
+    fn derives_definition_labels() {
+        assert_eq!(local_definition("PANEL", "{}").as_deref(), Some("Panel"));
+        assert_eq!(local_definition("COMMAND", "cw.command:New('A')").as_deref(), Some("Command"));
+        assert_eq!(local_definition("CLASS", "Clockwork.class:New('Citizen')").as_deref(), Some("Class"));
+        assert_eq!(local_definition("FACTION", "Clockwork.faction:New('Combine')").as_deref(), Some("Faction"));
+        assert_eq!(local_definition("SYSTEM", "cw.system:New('Manage Players')").as_deref(), Some("System"));
+        assert_eq!(local_definition("BLUEPRINT", "cw.blueprints:New()").as_deref(), Some("Blueprint"), "a plural library is named after the local");
+        assert_eq!(local_definition("THING", "item.New('x', true)").as_deref(), Some("Item"));
+        for (name, init) in [("CLASS_TABLE", "{}"), ("CLASS_TABLE", "{ __index = CLASS_TABLE }"), ("T", "setmetatable({}, mt)"), ("cable", "{}"), ("obj", "cw.thing:New()"), ("MAT", "cw.core:GetMaterial('x')"), ("X", "Cw.Thing:New()"), ("X", "make()")] {
+            assert_eq!(local_definition(name, init), None, "{name} = {init}");
+        }
+        assert_eq!((plural("Entity"), plural("Class"), plural("Command"), plural("Key")), ("Entities".to_string(), "Classes".to_string(), "Commands".to_string(), "Keys".to_string()));
+
+        let modules = core(vec![
+            ("core/commands/sh_a.lua", "local COMMAND = cw.command:New('A')\nfunction COMMAND:OnRun() end"),
+            ("core/derma/cl_menu.lua", "local PANEL = {}\nfunction PANEL:Init() end\nvgui.Register('cw.menu', PANEL)"),
+            ("core/libraries/sh_bars.lua", "library.New('bars', cw)\nlocal CLASS_TABLE = {}\nfunction CLASS_TABLE:Draw() end"),
+            ("core/named.lua", "local T = setmetatable({}, mt)\nfunction T:x() end"),
+            ("commands/sh_addbots.lua", "CMD.name = 'AddBots'\nfunction CMD:on_run() end"),
+            ("entities/entities/fl_money/shared.lua", "ENT.PrintName = 'Money'\nfunction ENT:Use() end"),
+        ]);
+        let command = module(&modules, "A");
+        assert_eq!((command.definition.as_deref(), command.subtitle.as_deref(), command.badge()), (Some("Command"), Some("Command defined in core/commands/sh_a.lua"), "command".to_string()));
+        assert_eq!(module(&modules, "cw.menu").definition.as_deref(), Some("Panel"));
+        let class = module(&modules, "cw.bars.Class");
+        assert_eq!((class.definition.as_deref(), class.badge()), (None, "object".to_string()));
+        assert_eq!(module(&modules, "named.T").definition, None);
+        let cmd = module(&modules, "sh_addbots");
+        assert_eq!((cmd.title.as_str(), cmd.definition.as_deref(), cmd.subtitle.as_deref()), ("AddBots", Some("Command"), Some("Command defined in commands/sh_addbots.lua")));
+        let money = module(&modules, "fl_money");
+        assert_eq!((money.definition.as_deref(), money.subtitle.as_deref()), (Some("Entity"), Some("Entity defined in entities/entities/fl_money")));
+    }
+
+    #[test]
+    fn lists_definitions_by_kind() {
+        let p = project(vec![
+            ("lib/sh_a.lua", "function A.x() end"),
+            ("lib/sh_b.lua", "local T = setmetatable({}, mt)\nfunction T:x() end"),
+            ("entities/entities/fl_money/shared.lua", "function ENT:Use() end"),
+            ("commands/sh_b.lua", "CMD.name = 'beta'\nfunction CMD:on_run() end"),
+            ("commands/sh_a.lua", "CMD.name = 'Alpha'\nfunction CMD:on_run() end"),
+            ("items/sh_box.lua", "function ITEM:on_use() end"),
+            ("views/cl_menu.lua", "function PANEL:Init() end"),
+            ("blueprints/sh_chair.lua", "local BLUEPRINT = cw.blueprints:New()\nfunction BLUEPRINT:OnBuild() end"),
+            ("systems/sh_x.lua", "local SYSTEM = cw.system:New('X')\nfunction SYSTEM:OnDisplay() end"),
+        ]);
+        let group = &p.sections[0].groups[0];
+        let code: Vec<&str> = group.code_modules().map(|m| m.id.as_str()).collect();
+        assert_eq!(code, vec!["A", "b.T"]);
+        let kinds = group.definitions();
+        let definitions: Vec<(&str, Vec<&str>)> = kinds.iter().map(|(label, ms)| (label.as_str(), ms.iter().map(|m| m.title.as_str()).collect())).collect();
+        assert_eq!(definitions, vec![
+            ("Commands", vec!["Alpha", "beta"]),
+            ("Items", vec!["sh_box"]),
+            ("Entities", vec!["fl_money"]),
+            ("Panels", vec!["cl_menu"]),
+            ("Blueprints", vec!["chair.Blueprint"]),
+            ("Systems", vec!["X"]),
+        ]);
     }
 }
