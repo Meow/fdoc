@@ -637,7 +637,6 @@ fn parse_meta_alias(toks: &[Token], i: usize) -> Option<(String, String)> {
     None
 }
 
-/// `local NAME = ...` -> (NAME, index of the first token of the right-hand side).
 /// The names the `local` statement at `i` declares: `local function f`
 /// gives `f`, `local a, b <const> = ...` gives `a` and `b`.
 fn local_names(toks: &[Token], i: usize) -> Vec<String> {
@@ -660,6 +659,7 @@ fn local_names(toks: &[Token], i: usize) -> Vec<String> {
     names
 }
 
+/// `local NAME = ...` -> (NAME, index of the first token of the right-hand side).
 fn parse_local(toks: &[Token], i: usize) -> Option<(String, usize)> {
     let name = toks.get(i + 1)?.name()?;
     if is_keyword(name) || !toks.get(i + 2)?.is_sym("=") || toks.get(i + 3).is_none_or(|t| matches!(t.tok, Tok::Comment { .. })) {
