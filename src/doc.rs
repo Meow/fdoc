@@ -8,14 +8,60 @@
 //! -- @return [Type description, Type description]
 //! -- @variant name(a)
 //! --   @param a [Type]
+//! --   @return [Type]
 //! -- @see [Owner#name]
 //! -- @warning [Internal] optional text
 //! -- @deprecation [reason]
 //! -- @deprecation_version [0.8.0]
 //! -- @alias [Other.name]
 //! -- @category [Name]
+//! -- @realm [server|client|shared]
+//! -- @module [Name]
 //! -- @ignore
 //! ```
+//!
+//! Indented `@param` and `@return` lines under a `@variant` belong to it.
+//! The summary is the first sentence of the description.
+
+/// Where a piece of code runs in Garry's Mod.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Realm {
+    Server,
+    Client,
+    Shared,
+}
+
+impl Realm {
+    /// Combines two realms: a specific realm overrides `Shared`, and
+    /// `Server` with `Client` is `Shared`.
+    #[allow(dead_code)]
+    pub fn combine(self, other: Realm) -> Realm {
+        match (self, other) {
+            (Realm::Shared, r) | (r, Realm::Shared) => r,
+            (a, b) if a == b => a,
+            _ => Realm::Shared,
+        }
+    }
+
+    /// The other side: `Server` and `Client` swap, `Shared` stays.
+    pub fn opposite(self) -> Realm {
+        match self {
+            Realm::Server => Realm::Client,
+            Realm::Client => Realm::Server,
+            Realm::Shared => Realm::Shared,
+        }
+    }
+
+    /// Parses `server`, `client` or `shared`, ignoring case.
+    pub fn parse(s: &str) -> Option<Realm> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "server" => Some(Realm::Server),
+            "client" => Some(Realm::Client),
+            "shared" => Some(Realm::Shared),
+            _ => None,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Param {
@@ -36,6 +82,8 @@ pub struct Variant {
     pub signature: String,
     pub description: String,
     pub params: Vec<Param>,
+    /// Indented `@return` lines under the `@variant`.
+    pub returns: Vec<Return>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -49,6 +97,8 @@ pub struct DocBlock {
     /// Markdown description, tags removed.
     pub description: String,
     pub params: Vec<Param>,
+    /// Top-level `@return` values; those indented under a `@variant` are in
+    /// `Variant::returns`.
     pub returns: Vec<Return>,
     pub variants: Vec<Variant>,
     pub see: Vec<String>,
@@ -57,6 +107,11 @@ pub struct DocBlock {
     pub deprecation_version: Option<String>,
     pub aliases: Vec<String>,
     pub category: Option<String>,
+    /// Explicit `@realm`.
+    pub realm: Option<Realm>,
+    /// `@module [Name]`: the module a file doc documents, or the name of the
+    /// object a local table defines.
+    pub module: Option<String>,
     pub ignore: bool,
     /// Tags this parser does not know about, kept as (name, text).
     pub other: Vec<(String, String)>,
@@ -71,8 +126,13 @@ impl DocBlock {
         self.warnings.iter().any(|w| w.label.as_deref().is_some_and(|l| l.eq_ignore_ascii_case("internal")))
     }
 
-    /// First paragraph of the description.
+    /// First sentence of the first paragraph of the description.
     pub fn summary(&self) -> String {
+        first_sentence(&self.first_paragraph()).to_string()
+    }
+
+    /// First paragraph of the description, joined into one line.
+    pub fn first_paragraph(&self) -> String {
         let mut out = Vec::new();
         for line in self.description.lines() {
             let t = line.trim();
@@ -89,6 +149,41 @@ impl DocBlock {
         }
         out.join(" ")
     }
+}
+
+/// Cuts `text` after its first sentence: a `.`, `!` or `?` followed by
+/// whitespace or the end, outside backticks and parentheses. A period
+/// followed by a lowercase word (`e.g. this`) or ending an abbreviation such
+/// as `e.g.` does not end the sentence.
+fn first_sentence(text: &str) -> &str {
+    let chars: Vec<(usize, char)> = text.char_indices().collect();
+    let mut in_code = false;
+    let mut parens = 0usize;
+    for (k, &(pos, c)) in chars.iter().enumerate() {
+        match c {
+            '`' => in_code = !in_code,
+            '(' if !in_code => parens += 1,
+            ')' if !in_code => parens = parens.saturating_sub(1),
+            '.' | '!' | '?' if !in_code && parens == 0 => {
+                if chars.get(k + 1).is_some_and(|&(_, n)| !n.is_whitespace()) {
+                    continue;
+                }
+                let following = chars[k + 1..].iter().map(|&(_, n)| n).find(|n| !n.is_whitespace());
+                if c == '.' && (following.is_some_and(char::is_lowercase) || is_abbreviation(&text[..pos])) {
+                    continue;
+                }
+                return &text[..pos + c.len_utf8()];
+            }
+            _ => {}
+        }
+    }
+    text
+}
+
+/// True when `before` (the text up to a period) ends with an abbreviation.
+fn is_abbreviation(before: &str) -> bool {
+    let word = before.rsplit(|c: char| !(c.is_alphanumeric() || c == '.')).next().unwrap_or("");
+    ["e.g", "i.e", "vs", "cf"].iter().any(|a| word.eq_ignore_ascii_case(a))
 }
 
 /// Strips the comment markers from the raw comment texts (the text after
@@ -311,12 +406,21 @@ pub fn parse_lines(lines: &[String]) -> DocBlock {
             }
             Line::Tag { indent, name, body } => {
                 let lname = name.to_ascii_lowercase();
-                // A nested @param belongs to the open variant.
-                if let (true, Some((idx, vindent))) = (lname == "param", current_variant)
+                // A nested @param or @return belongs to the open variant.
+                if let Some((idx, vindent)) = current_variant
                     && indent > vindent
                 {
-                    doc.variants[idx].params.push(parse_param(&body));
-                    continue;
+                    match lname.as_str() {
+                        "param" => {
+                            doc.variants[idx].params.push(parse_param(&body));
+                            continue;
+                        }
+                        "return" | "returns" => {
+                            doc.variants[idx].returns.extend(parse_returns(&body));
+                            continue;
+                        }
+                        _ => {}
+                    }
                 }
                 if lname != "variant" {
                     flush(&mut pending, &mut description);
@@ -337,7 +441,7 @@ pub fn parse_lines(lines: &[String]) -> DocBlock {
                         let desc = pending.join(" ");
                         pending.clear();
                         pending_has_first_line = false;
-                        doc.variants.push(Variant { signature: body.trim().to_string(), description: desc.trim().to_string(), params: Vec::new() });
+                        doc.variants.push(Variant { signature: body.trim().to_string(), description: desc.trim().to_string(), params: Vec::new(), returns: Vec::new() });
                         current_variant = Some((doc.variants.len() - 1, indent));
                     }
                     "see" => {
@@ -371,6 +475,20 @@ pub fn parse_lines(lines: &[String]) -> DocBlock {
                     "category" => {
                         let (label, text) = split_leading_bracket(&body);
                         doc.category = Some(label.unwrap_or(text));
+                    }
+                    "realm" => {
+                        let (label, text) = split_leading_bracket(&body);
+                        match Realm::parse(&label.unwrap_or(text)) {
+                            Some(realm) => doc.realm = Some(realm),
+                            None => doc.other.push((name, body)),
+                        }
+                    }
+                    "module" => {
+                        let (label, text) = split_leading_bracket(&body);
+                        let module = label.unwrap_or(text);
+                        if !module.is_empty() {
+                            doc.module = Some(module);
+                        }
                     }
                     "ignore" => doc.ignore = true,
                     _ => doc.other.push((name, body)),
@@ -499,5 +617,62 @@ mod tests {
         let doc = parse(&raw("--- @warning [Internal]\n-- Creates the player's default inventories."));
         assert_eq!(doc.description, "Creates the player's default inventories.");
         assert!(doc.is_internal());
+    }
+
+    #[test]
+    fn summary_is_the_first_sentence() {
+        let summary = |s: &str| parse(&raw(s)).summary();
+        assert_eq!(summary("--- Does x. Then y."), "Does x.");
+        assert_eq!(summary("--- Calls `a.b` then stops. More."), "Calls `a.b` then stops.");
+        assert_eq!(summary("--- Runs e.g. the thing. More."), "Runs e.g. the thing.");
+        assert_eq!(summary("--- Runs a task, e.g. 'migrate', in sync. More."), "Runs a task, e.g. 'migrate', in sync.");
+        assert_eq!(summary("--- A single sentence without a period"), "A single sentence without a period");
+        assert_eq!(summary("--- Wraps the call (see x. y) first! Then more."), "Wraps the call (see x. y) first!");
+        assert_eq!(summary("--- Is it valid?\n-- Second line.\n--\n-- Second paragraph."), "Is it valid?");
+        assert_eq!(summary("--- Spans\n-- two lines. Rest."), "Spans two lines.");
+        assert_eq!(summary("--- Version 1.5 of `x`."), "Version 1.5 of `x`.");
+    }
+
+    #[test]
+    fn indented_returns_belong_to_variants() {
+        let doc = parse(&raw(
+            "--- Finds things.
+-- @variant find(id)
+--   @param id [Number]
+--   @return [Item the item]
+-- @variant find()
+--   @return [List<Item> all items]
+-- @return [Boolean found]",
+        ));
+        assert_eq!(doc.variants[0].returns.len(), 1);
+        assert_eq!(doc.variants[0].returns[0].ty.as_deref(), Some("Item"));
+        assert_eq!(doc.variants[1].returns[0].ty.as_deref(), Some("List<Item>"));
+        assert!(doc.variants[1].params.is_empty());
+        assert_eq!(doc.returns.len(), 1);
+        assert_eq!(doc.returns[0].ty.as_deref(), Some("Boolean"));
+    }
+
+    #[test]
+    fn parses_realm_and_module() {
+        let doc = parse(&raw("--- Server side.\n-- @realm [Server]"));
+        assert_eq!(doc.realm, Some(Realm::Server));
+        let doc = parse(&raw("--- Client side.\n-- @realm client"));
+        assert_eq!(doc.realm, Some(Realm::Client));
+        let doc = parse(&raw("--- Odd.\n-- @realm [moon]"));
+        assert_eq!(doc.realm, None);
+        assert_eq!(doc.other, vec![("realm".to_string(), "[moon]".to_string())]);
+        let doc = parse(&raw("--- Currencies.\n-- @module [cw.currency]"));
+        assert_eq!(doc.module.as_deref(), Some("cw.currency"));
+        assert_eq!(doc.description, "Currencies.");
+    }
+
+    #[test]
+    fn combines_realms() {
+        assert_eq!(Realm::Shared.combine(Realm::Server), Realm::Server);
+        assert_eq!(Realm::Client.combine(Realm::Shared), Realm::Client);
+        assert_eq!(Realm::Server.combine(Realm::Client), Realm::Shared);
+        assert_eq!(Realm::Server.combine(Realm::Server), Realm::Server);
+        assert_eq!(Realm::Server.opposite(), Realm::Client);
+        assert_eq!(Realm::Shared.opposite(), Realm::Shared);
     }
 }

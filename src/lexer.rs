@@ -10,7 +10,8 @@ pub enum Tok {
     Name(String),
     /// String literal, with the delimiters removed.
     Str(String),
-    Number,
+    /// Numeric literal, as written.
+    Number(String),
     /// Comment text, with the comment delimiters removed.
     Comment { text: String, long: bool },
     /// Punctuation / operator.
@@ -160,7 +161,7 @@ pub fn tokenize(src: &str) -> Vec<Token> {
             while j < b.len() && (b[j].is_ascii_alphanumeric() || b[j] == b'.' || ((b[j] == b'-' || b[j] == b'+') && matches!(b[j - 1], b'e' | b'E' | b'p' | b'P'))) {
                 j += 1;
             }
-            out.push(Token { tok: Tok::Number, line: start_line, line_start: at_line_start });
+            out.push(Token { tok: Tok::Number(src[i..j].to_string()), line: start_line, line_start: at_line_start });
             i = j;
             continue;
         }
@@ -265,7 +266,7 @@ mod tests {
         let long = toks.iter().find(|t| matches!(&t.tok, Tok::Comment { long: true, .. })).unwrap();
         assert_eq!(long.line, 3);
         let last = toks.last().unwrap();
-        assert!(matches!(last.tok, Tok::Number));
+        assert!(matches!(&last.tok, Tok::Number(n) if n == "1.5e-3"));
         assert_eq!(last.line, 4);
     }
 
