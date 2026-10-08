@@ -26,6 +26,9 @@ pub const HOOK_CALLERS: [(&str, usize); 7] = [
 /// Longest source rendering kept for `LocalTable::init` and `HookCall::args`.
 const MAX_SOURCE_LEN: usize = 80;
 
+/// Longest source rendering kept for `Branch::condition`.
+const MAX_CONDITION_LEN: usize = 60;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Sep {
     /// `Owner.name` — a function stored in a table.
@@ -34,6 +37,17 @@ pub enum Sep {
     Colon,
     /// `name` — a global function.
     None,
+}
+
+/// The arm of an `if` statement a declaration sits in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Branch {
+    /// Identifies the `if` statement in its file: the index of its token.
+    pub if_id: usize,
+    /// In an `elseif` or `else` arm rather than the first one.
+    pub else_branch: bool,
+    /// Compact source of the first arm's condition, cut after 60 characters.
+    pub condition: String,
 }
 
 #[derive(Debug, Clone)]
@@ -53,6 +67,9 @@ pub struct FunctionDecl {
     /// Index into `FileScan::locals` of the most recent top-level local
     /// named like the first component of `owner` (`PANEL` for `PANEL:Init`).
     pub local_table: Option<usize>,
+    /// The innermost enclosing `if` statement and the arm the declaration
+    /// is in.
+    pub branch: Option<Branch>,
 }
 
 impl FunctionDecl {
@@ -175,15 +192,24 @@ struct Frame {
     rest: Option<Realm>,
     /// Qualified name of a named function declaration.
     name: Option<String>,
+    /// The arm an `if` statement is in.
+    branch: Option<Branch>,
 }
 
 impl Frame {
     fn function(name: Option<String>) -> Frame {
-        Frame { kind: Block::Function, realm: None, rest: None, name }
+        Frame { kind: Block::Function, realm: None, rest: None, name, branch: None }
     }
 
     fn other(realm: Option<Realm>) -> Frame {
-        Frame { kind: Block::Other, realm, rest: realm.map(Realm::opposite), name: None }
+        Frame { kind: Block::Other, realm, rest: realm.map(Realm::opposite), name: None, branch: None }
+    }
+
+    /// The `if` statement at token `i`.
+    fn conditional(toks: &[Token], i: usize) -> Frame {
+        let condition = render(toks, i + 1..condition_end(toks, i + 1));
+        let condition = if condition.chars().count() > MAX_CONDITION_LEN { format!("{}…", condition.chars().take(MAX_CONDITION_LEN).collect::<String>().trim_end()) } else { condition };
+        Frame { branch: Some(Branch { if_id: i, else_branch: false, condition }), ..Frame::other(condition_realm(toks, i + 1)) }
     }
 }
 
@@ -318,7 +344,7 @@ pub fn scan(src: &str) -> FileScan {
                     continue;
                 }
                 "if" => {
-                    s.stack.push(Frame::other(condition_realm(&toks, i + 1)));
+                    s.stack.push(Frame::conditional(&toks, i));
                     i += 1;
                     continue;
                 }
@@ -329,6 +355,9 @@ pub fn scan(src: &str) -> FileScan {
                         if realm.is_some() {
                             frame.rest = realm.map(Realm::opposite);
                         }
+                        if let Some(branch) = &mut frame.branch {
+                            branch.else_branch = true;
+                        }
                     }
                     i += 1;
                     continue;
@@ -336,6 +365,9 @@ pub fn scan(src: &str) -> FileScan {
                 "else" => {
                     if let Some(frame) = s.stack.last_mut().filter(|f| f.kind == Block::Other) {
                         frame.realm = frame.rest;
+                        if let Some(branch) = &mut frame.branch {
+                            branch.else_branch = true;
+                        }
                     }
                     i += 1;
                     continue;
@@ -445,6 +477,11 @@ impl Scanner {
         self.stack.iter().rev().find_map(|f| f.realm).unwrap_or(Realm::Shared)
     }
 
+    /// The innermost enclosing `if` statement and its current arm.
+    fn branch(&self) -> Option<Branch> {
+        self.stack.iter().rev().find_map(|f| f.branch.clone())
+    }
+
     /// Name of the innermost enclosing function, if it is a named one.
     fn caller(&self) -> Option<String> {
         self.stack.iter().rev().find(|f| f.kind == Block::Function).and_then(|f| f.name.clone())
@@ -487,6 +524,7 @@ impl Scanner {
         let first = decl.owner.split('.').next().unwrap_or("");
         decl.local_table = if first.is_empty() { None } else { self.out.locals.iter().rposition(|l| l.name == first) };
         decl.realm = self.realm();
+        decl.branch = self.branch();
         decl.doc = doc;
         decl.category = self.category.clone();
         self.out.functions.push(decl);
@@ -531,7 +569,7 @@ fn parse_function_decl(toks: &[Token], i: usize) -> Option<(FunctionDecl, usize)
 }
 
 fn new_decl(owner: String, sep: Sep, name: String, params: Vec<String>, line: usize) -> FunctionDecl {
-    FunctionDecl { owner, sep, name, params, line, doc: None, category: None, realm: Realm::Shared, local_table: None }
+    FunctionDecl { owner, sep, name, params, line, doc: None, category: None, realm: Realm::Shared, local_table: None, branch: None }
 }
 
 /// Parses `Name.path = function(...)` / `Name.path = function(...)`.
@@ -869,6 +907,22 @@ fn condition_realm(toks: &[Token], start: usize) -> Option<Realm> {
     found
 }
 
+/// Index of the `then` that ends the `if` / `elseif` condition starting at
+/// `start`, or the end of the tokens.
+fn condition_end(toks: &[Token], start: usize) -> usize {
+    let mut depth = 0isize;
+    for (j, t) in toks.iter().enumerate().skip(start) {
+        if depth == 0 && t.is_name("then") {
+            return j;
+        }
+        depth += depth_change(t);
+        if depth < 0 {
+            return j;
+        }
+    }
+    toks.len()
+}
+
 /// Renders the tokens in `range` as compact source: strings in single
 /// quotes, one space between tokens except around `.`, `:` and brackets,
 /// before `,` and after unary operators. Cut after `MAX_SOURCE_LEN`
@@ -1118,6 +1172,50 @@ do if CLIENT then function n() end end end
         ];
         assert_eq!(realms, expected.iter().map(|(n, r)| (n.to_string(), *r)).collect::<Vec<_>>());
         assert_eq!(scan.hook_calls[0].realm, Realm::Server);
+    }
+
+    #[test]
+    fn records_branches() {
+        let scan = scan(
+            "function a() end
+if is_development then
+  function b() end
+  if not Flux.development and (x or y) then
+    function c() end
+  elseif SERVER then
+    function d() end
+  end
+  for i = 1, 2 do function e() end end
+else
+  function f() end
+end
+if x == 1 then
+elseif x == 2 then
+  function g() end
+else
+  function h() end
+end
+if a_very_long_condition_name_that_goes_on and another_rather_long_name_too then function i() end end
+",
+        );
+        let branches = scan.functions.iter().map(|f| (f.name.as_str(), f.branch.as_ref().map(|b| (b.if_id, b.else_branch, b.condition.as_str())))).collect::<Vec<_>>();
+        let outer = branches[1].1.unwrap().0;
+        let inner = branches[2].1.unwrap().0;
+        let third = branches[6].1.unwrap().0;
+        assert!(outer != inner && inner != third && outer != third);
+        assert_eq!(branches[..8], [
+            ("a", None),
+            ("b", Some((outer, false, "is_development"))),
+            ("c", Some((inner, false, "not Flux.development and (x or y)"))),
+            ("d", Some((inner, true, "not Flux.development and (x or y)"))),
+            ("e", Some((outer, false, "is_development"))),
+            ("f", Some((outer, true, "is_development"))),
+            ("g", Some((third, true, "x == 1"))),
+            ("h", Some((third, true, "x == 1"))),
+        ]);
+        let long = &scan.functions[8].branch.as_ref().unwrap().condition;
+        assert!(long.starts_with("a_very_long_condition_name_that_goes_on and another") && long.ends_with('…') && long.chars().count() <= 61, "{long}");
+        assert_eq!(super::scan("if !Flux.development then function x() end end").functions[0].branch.as_ref().unwrap().condition, "!Flux.development");
     }
 
     #[test]

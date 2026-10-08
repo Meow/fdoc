@@ -3,7 +3,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
-use crate::doc::{DocBlock, Realm};
+use crate::doc::{DocBlock, Environment, Realm};
 use crate::layout::{GroupMeta, Layout, Placement};
 use crate::scanner::{path_realm, Category, FileScan, FunctionDecl, Sep};
 
@@ -82,6 +82,17 @@ pub enum FunctionKind {
     HookAdd,
 }
 
+/// The definition of a branch twin in the `else` arm of the `if` statement
+/// whose first arm holds the primary definition.
+#[derive(Debug, Clone)]
+pub struct Otherwise {
+    /// Source of the first arm's condition, such as `is_development`.
+    pub condition: String,
+    pub doc: Option<DocBlock>,
+    pub file: String,
+    pub line: usize,
+}
+
 #[derive(Debug, Clone)]
 pub struct Function {
     pub name: String,
@@ -102,7 +113,8 @@ pub struct Function {
     /// into one function are `Shared`.
     pub realm: Realm,
     /// Every definition (file, line, realm), the primary one first. More
-    /// than one for merged realm twins; every call site for a hook.
+    /// than one for merged realm and branch twins; every call site for a
+    /// hook.
     pub sources: Vec<(String, usize, Realm)>,
     /// Realm of the definition `doc` comes from. For merged twins it can
     /// differ from the primary definition's realm, when that one is not
@@ -111,6 +123,9 @@ pub struct Function {
     /// The client definition's doc of a merged twin, when it differs from
     /// `doc`.
     pub client_doc: Option<DocBlock>,
+    /// The `else` arm definition of a branch twin: a function defined in
+    /// both arms of one `if` statement.
+    pub otherwise: Option<Otherwise>,
     /// For hooks: the functions that run it, qualified as they are
     /// documented (`Player:GetData`, `cw.core:Initialize`, `helper`).
     pub callers: Vec<String>,
@@ -165,6 +180,12 @@ impl Module {
 
     pub fn summary(&self) -> String {
         self.doc.as_ref().map(|d| d.summary()).unwrap_or_default()
+    }
+
+    /// The environment the module's doc limits it to (`@environment` in
+    /// the file doc).
+    pub fn environment(&self) -> Option<&Environment> {
+        self.doc.as_ref().and_then(|d| d.environment.as_ref())
     }
 }
 
@@ -776,7 +797,35 @@ fn merge_twin(e: &mut Function, mut f: Function) {
     e.doc = doc;
     e.client_doc = docs.find(|(r, d)| *r == Realm::Client && !e.doc.as_ref().is_some_and(|p| same_text(p, d))).map(|(_, d)| d);
     e.sources.extend(f.sources);
+    e.otherwise = e.otherwise.take().or(f.otherwise);
     e.realm = Realm::Shared;
+}
+
+/// Pairs the branch twins of a file: a function declared in the first arm
+/// of an `if` statement and again, under the same name and for the same
+/// realm, in one of its `elseif` / `else` arms. Maps the index of the first
+/// arm's declaration to the other's.
+fn branch_twins(path: &str, scan: &FileScan) -> HashMap<usize, usize> {
+    let mut twins = HashMap::new();
+    let mut taken = HashSet::new();
+    let realm = |f: &FunctionDecl| definition_realm(f.doc.as_ref(), f.realm, path);
+    for (i, f) in scan.functions.iter().enumerate() {
+        let Some(branch) = f.branch.as_ref().filter(|b| !b.else_branch) else { continue };
+        let twin = scan.functions.iter().enumerate().skip(i + 1).find(|(k, g)| {
+            !taken.contains(k)
+                && g.name == f.name
+                && g.sep == f.sep
+                && g.owner == f.owner
+                && g.local_table == f.local_table
+                && g.branch.as_ref().is_some_and(|b| b.if_id == branch.if_id && b.else_branch)
+                && realm(g) == realm(f)
+        });
+        if let Some((k, _)) = twin {
+            taken.insert(k);
+            twins.insert(i, k);
+        }
+    }
+    twins
 }
 
 /// The doc of the `GM`, else the `Schema` handler of a hook, for a hook
@@ -841,8 +890,14 @@ fn build_modules(gb: &GroupBuilder, group_title: &str, documented_only: bool, ca
         let objects = local_objects(path, &rel_path(gb, path), scan, documented_only);
         file_objects.insert(path, objects.iter().flatten().map(|t| t.key.clone()).collect());
 
-        for f in &scan.functions {
-            if documented_only && f.doc.is_none() {
+        let twins = branch_twins(path, scan);
+        let others: HashSet<usize> = twins.values().copied().collect();
+        for (index, f) in scan.functions.iter().enumerate() {
+            if others.contains(&index) {
+                continue;
+            }
+            let other = twins.get(&index).map(|&k| &scan.functions[k]);
+            if documented_only && f.doc.is_none() && other.is_none_or(|o| o.doc.is_none()) {
                 continue;
             }
             let owner = resolve_owner(&f.owner, scan, &gb.plugin_global);
@@ -871,6 +926,11 @@ fn build_modules(gb: &GroupBuilder, group_title: &str, documented_only: bool, ca
             ensure_category(m, &category, &file_categories);
 
             let realm = definition_realm(f.doc.as_ref(), f.realm, path);
+            let mut sources = vec![(path.clone(), f.line, realm)];
+            let otherwise = other.map(|o| {
+                sources.push((path.clone(), o.line, realm));
+                Otherwise { condition: f.branch.as_ref().map(|b| b.condition.clone()).unwrap_or_default(), doc: o.doc.clone(), file: path.clone(), line: o.line }
+            });
             add_function(
                 m,
                 Function {
@@ -885,9 +945,10 @@ fn build_modules(gb: &GroupBuilder, group_title: &str, documented_only: bool, ca
                     category,
                     kind: FunctionKind::Declared,
                     realm,
-                    sources: vec![(path.clone(), f.line, realm)],
+                    sources,
                     doc_realm: realm,
                     client_doc: None,
+                    otherwise,
                     callers: Vec::new(),
                     hook_id: None,
                     implements: None,
@@ -934,6 +995,7 @@ fn build_modules(gb: &GroupBuilder, group_title: &str, documented_only: bool, ca
                 sources: vec![(path.clone(), add.line, realm)],
                 doc_realm: realm,
                 client_doc: None,
+                otherwise: None,
                 callers: Vec::new(),
                 hook_id: add.id.clone(),
                 implements: None,
@@ -985,6 +1047,7 @@ fn build_modules(gb: &GroupBuilder, group_title: &str, documented_only: bool, ca
             sources,
             doc_realm: realm,
             client_doc: None,
+            otherwise: None,
             callers: sites.iter().filter_map(|(p, c)| c.caller.as_ref().map(|caller| format!("{p}\u{0}{caller}"))).collect(),
             hook_id: None,
             implements: None,
@@ -1469,6 +1532,62 @@ mod tests {
         assert_eq!((think.realm, think.file.as_str(), think.sources.len()), (Realm::Shared, "entities/entities/cw_lamp/shared.lua", 3));
         assert_eq!((think.summary(), think.doc_realm), ("Updates the lamp.".to_string(), Realm::Shared));
         assert_eq!(think.client_doc.as_ref().map(|d| d.summary()).as_deref(), Some("Draws the glow."), "the client doc survives the later merge");
+    }
+
+    #[test]
+    fn merges_branch_twins() {
+        let modules = core(vec![
+            (
+                "lib/sh_debug.lua",
+                "local is_development = x
+if is_development then
+  --- Adds a metric.
+  -- @param id [String]
+  function add(id) end
+  function Debug.both() end
+else
+  --- Does nothing.
+  function add(id) end
+  function Debug.both() end
+end
+if a then function twice() end end
+if b then function twice() end end
+if SERVER then function realms() end else function realms() end end
+if c then function split() end else function Other.split() end end",
+            ),
+            ("lib/sv_x.lua", "if y then\n  --- Server y.\n  function X.y() end\nelse\n  --- Server stub.\n  function X.y() end\nend"),
+            ("lib/cl_x.lua", "if y then\n  function X.y() end\nelse\n  function X.y() end\nend"),
+        ]);
+        let globals = module(&modules, "Globals");
+        let get = |name: &str| -> Vec<&Function> { globals.functions.iter().filter(|f| f.name == name).collect() };
+
+        let add = get("add");
+        assert_eq!(add.len(), 1);
+        let add = add[0];
+        assert_eq!((add.summary().as_str(), add.line, add.realm), ("Adds a metric.", 5, Realm::Shared));
+        let other = add.otherwise.as_ref().unwrap();
+        assert_eq!((other.condition.as_str(), other.file.as_str(), other.line), ("is_development", "lib/sh_debug.lua", 9));
+        assert_eq!(other.doc.as_ref().unwrap().summary(), "Does nothing.");
+        assert_eq!(add.sources, vec![("lib/sh_debug.lua".to_string(), 5, Realm::Shared), ("lib/sh_debug.lua".to_string(), 9, Realm::Shared)]);
+
+        let both = &module(&modules, "Debug").functions;
+        assert_eq!(both.len(), 1);
+        assert!(both[0].otherwise.as_ref().is_some_and(|o| o.doc.is_none()));
+
+        assert_eq!(get("twice").len(), 2, "definitions in unrelated ifs stay apart");
+        assert!(get("twice").iter().all(|f| f.otherwise.is_none() && f.sources.len() == 1));
+        let realms = get("realms");
+        assert_eq!(realms.len(), 1);
+        assert!(realms[0].otherwise.is_none(), "server and client arms are realm twins");
+        assert_eq!(realms[0].realm, Realm::Shared);
+        assert!(get("split")[0].otherwise.is_none(), "different owners are not twins");
+
+        let y = &module(&modules, "X").functions;
+        assert_eq!(y.len(), 1, "branch twins of both realms merge into one");
+        assert_eq!((y[0].realm, y[0].file.as_str(), y[0].line, y[0].sources.len()), (Realm::Shared, "lib/sv_x.lua", 3, 4));
+        assert_eq!(y[0].summary(), "Server y.");
+        let other = y[0].otherwise.as_ref().unwrap();
+        assert_eq!((other.file.as_str(), other.line, other.doc.as_ref().map(|d| d.summary())), ("lib/sv_x.lua", 6, Some("Server stub.".to_string())));
     }
 
     #[test]

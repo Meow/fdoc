@@ -11,6 +11,7 @@
 //! --   @return [Type]
 //! -- @see [Owner#name]
 //! -- @warning [Internal] optional text
+//! -- @environment [development] optional text (alias @env)
 //! -- @deprecation [reason]
 //! -- @deprecation_version [0.8.0]
 //! -- @alias [Other.name]
@@ -81,6 +82,28 @@ pub struct Warning {
     pub text: String,
 }
 
+/// `@environment [name] text`: the code only does its work in the named
+/// environment (`development`, `production`, ...).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Environment {
+    pub name: String,
+    pub text: String,
+}
+
+impl Environment {
+    /// The admonition title: the name capitalised, as in `Development only`.
+    pub fn title(&self) -> String {
+        let mut chars = self.name.chars();
+        let name: String = chars.next().map(|c| c.to_uppercase().chain(chars).collect()).unwrap_or_default();
+        format!("{name} only")
+    }
+
+    /// The tag's text, else a sentence naming the environment.
+    pub fn text(&self) -> String {
+        if self.text.is_empty() { format!("Only available in the {} environment.", self.name) } else { self.text.clone() }
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct DocBlock {
     /// Markdown description, tags removed.
@@ -94,6 +117,8 @@ pub struct DocBlock {
     pub warnings: Vec<Warning>,
     pub deprecation: Option<String>,
     pub deprecation_version: Option<String>,
+    /// `@environment` (alias `@env`).
+    pub environment: Option<Environment>,
     pub aliases: Vec<String>,
     pub category: Option<String>,
     /// Explicit `@realm`.
@@ -462,6 +487,20 @@ pub fn parse_lines(lines: &[String]) -> DocBlock {
                         let (label, text) = split_leading_bracket(&body);
                         doc.deprecation_version = Some(label.unwrap_or(text));
                     }
+                    "environment" | "env" => {
+                        let (label, text) = match split_leading_bracket(&body) {
+                            (Some(label), text) => (label, text),
+                            (None, text) => match text.split_once(char::is_whitespace) {
+                                Some((word, rest)) => (word.to_string(), rest.trim().to_string()),
+                                None => (text, String::new()),
+                            },
+                        };
+                        if label.is_empty() {
+                            doc.other.push((name, body));
+                        } else {
+                            doc.environment = Some(Environment { name: label, text });
+                        }
+                    }
                     "alias" => {
                         let (label, text) = split_leading_bracket(&body);
                         doc.aliases.push(label.unwrap_or(text));
@@ -658,6 +697,27 @@ mod tests {
         let doc = parse(&raw("--- Currencies.\n-- @module [cw.currency]"));
         assert_eq!(doc.module.as_deref(), Some("cw.currency"));
         assert_eq!(doc.description, "Currencies.");
+    }
+
+    #[test]
+    fn parses_environments() {
+        let doc = parse(&raw("--- Registers a metric.\n-- @environment [development]\n-- @param id [String]"));
+        let env = doc.environment.as_ref().unwrap();
+        assert_eq!((env.name.as_str(), env.text.as_str()), ("development", ""));
+        assert_eq!(env.title(), "Development only");
+        assert_eq!(env.text(), "Only available in the development environment.");
+        assert_eq!(doc.description, "Registers a metric.");
+        assert_eq!(doc.params[0].name, "id");
+        let doc = parse(&raw("--- Seeds.\n-- @env [production] Skipped in `test`."));
+        let env = doc.environment.unwrap();
+        assert_eq!((env.name.as_str(), env.text.as_str()), ("production", "Skipped in `test`."));
+        assert_eq!(env.text(), "Skipped in `test`.");
+        let doc = parse(&raw("--- Bare.\n-- @environment development Collects metrics."));
+        let env = doc.environment.unwrap();
+        assert_eq!((env.name.as_str(), env.text.as_str()), ("development", "Collects metrics."));
+        let doc = parse(&raw("--- Empty.\n-- @environment []"));
+        assert!(doc.environment.is_none());
+        assert_eq!(doc.other, vec![("environment".to_string(), "[]".to_string())]);
     }
 
     #[test]

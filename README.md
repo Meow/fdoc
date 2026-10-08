@@ -178,6 +178,19 @@ free functions are listed under `Globals`.
   once for the client (such as in `sv_kernel.lua` and `cl_kernel.lua`) is
   shown once, as shared, with both definitions; when their doc comments
   differ, both are shown, the client's under "On the client".
+- **Branch twins.** A function defined in the first arm of an `if`
+  statement and again in one of its `elseif` / `else` arms, for the same
+  realm, such as a real implementation under
+  `if is_development then` and a stub that does nothing under `else`, is
+  shown once with both definitions. The first arm's definition is the
+  primary one; the other's doc follows under "Otherwise", introduced by the
+  condition that does not hold (`When is_development does not hold:`), with
+  its first paragraph and parameters left out when they repeat the primary
+  doc's. When the primary doc has an `@environment` tag, the block is titled
+  "In other environments" instead. Only the innermost `if` around a
+  definition counts, so definitions in two separate `if` statements stay
+  apart. Branch twins in a server and a client file are then merged as
+  above.
 
 A file's doc comment documents the module its `@module` names, else the
 library it declares, else the only module its functions are in. Without
@@ -227,6 +240,7 @@ Supported tags:
 | `@variant name(a, b)` | An alternative signature. Indented `@param` and `@return` lines below it belong to the variant, and the text just above it describes it. A `@return` that is not indented applies to the whole function. |
 | `@see [Reference]` or `@see Reference` | A related function or module (`Owner#name`, `Owner:name`, `Owner.name`, `name` or `Owner`). |
 | `@warning [Label] text` | A warning box. The `Internal` label marks the function as internal. |
+| `@environment [name] text` or `@env` | The code only does its work in the named environment (`development`, `production`, ...). The name is shown as a marker next to the function, and the doc starts with a box titled after it (`Development only`) that holds the text, else "Only available in the development environment.". In a file's doc comment, it marks the module the file documents, such as a file that returns early outside of development. |
 | `@deprecation [reason]` | Marks the function as deprecated. |
 | `@deprecation_version [version]` | The version the deprecation starts at. |
 | `@alias [Other.name]` | Another name the function is available under. |

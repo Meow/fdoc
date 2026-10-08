@@ -22,6 +22,8 @@
   --internal-border: #8b76c2;
   --deprecated-background: #fdecec;
   --deprecated-border: #c0392b;
+  --environment-background: #e2f4ef;
+  --environment-border: #0f7a66;
   --badge-background-saturation: 40%;
   --badge-background-lightness: 92%;
   --badge-text-saturation: 45%;
@@ -68,6 +70,8 @@
     --internal-border: #8b76c2;
     --deprecated-background: #301c1c;
     --deprecated-border: #e06c5c;
+    --environment-background: #142b27;
+    --environment-border: #3cc4a6;
     --badge-background-saturation: 28%;
     --badge-background-lightness: 20%;
     --badge-text-saturation: 80%;
@@ -111,6 +115,8 @@
   --internal-border: #8b76c2;
   --deprecated-background: #301c1c;
   --deprecated-border: #e06c5c;
+  --environment-background: #142b27;
+  --environment-border: #3cc4a6;
   --badge-background-saturation: 28%;
   --badge-background-lightness: 20%;
   --badge-text-saturation: 80%;
@@ -297,7 +303,7 @@ th { background: var(--code-background); }
   color: hsl(var(--badge-hue) var(--badge-text-saturation) var(--badge-text-lightness));
   text-transform: uppercase; letter-spacing: 0.04em; margin-left: 0.3em;
 }
-h1 .badge, h1 .realm { font-size: 0.75rem; }
+h1 .badge, h1 .realm, h1 .flag { font-size: 0.75rem; }
 .badge-class { --badge-hue: 262; }
 .badge-library { --badge-hue: 190; }
 .badge-object { --badge-hue: 320; }
@@ -330,6 +336,7 @@ h1 .badge, h1 .realm { font-size: 0.75rem; }
 }
 .flag-deprecated { background: var(--deprecated-background); color: var(--deprecated-border); }
 .flag-internal { background: var(--internal-background); color: var(--internal-border); }
+.flag-environment { background: var(--environment-background); color: var(--environment-border); cursor: default; }
 
 .summary-row { padding: 0.5em 0; border-bottom: 1px solid var(--border); }
 .summary-row:last-child { border-bottom: none; }
@@ -362,6 +369,10 @@ h1 .badge, h1 .realm { font-size: 0.75rem; }
 .realm-doc-client { --realm-dot: var(--realm-client); }
 .realm-doc-shared { --realm-dot: var(--main-light); }
 .realm-doc-title { font-weight: 700; color: var(--text-headings); margin: 0 0 0.5em; }
+.otherwise { border-left: 3px solid var(--border); padding: 0.1em 0 0.1em 1em; margin: 0 0 1.4em; }
+.otherwise > :last-child { margin-bottom: 0; }
+.otherwise-title { font-weight: 700; color: var(--text-headings); margin: 0 0 0.5em; }
+.otherwise-title .source-link { margin-left: 0.6em; font-weight: 400; }
 
 .admonition { padding: 0.8em 1em; margin: 1em 0; border-radius: 6px; border-left: 3px solid var(--warning-border); background: var(--warning-background); }
 .admonition p { margin: 0; }
@@ -369,6 +380,7 @@ h1 .badge, h1 .realm { font-size: 0.75rem; }
 .admonition-title { font-weight: 700; }
 .admonition.internal { background: var(--internal-background); border-color: var(--internal-border); }
 .admonition.deprecated { background: var(--deprecated-background); border-color: var(--deprecated-border); }
+.admonition.environment { background: var(--environment-background); border-color: var(--environment-border); }
 
 .params, .returns, .aliases, .see-also, .variants, .callers, .source-list { list-style: none; padding: 0; margin: 0 0 1em; }
 .source-list .source-link { margin: 0; font-size: 0.85em; }

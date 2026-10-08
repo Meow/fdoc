@@ -2,7 +2,7 @@
 
 use std::fmt::Write;
 
-use crate::doc::{summary_of, DocBlock, Realm, Return};
+use crate::doc::{summary_of, DocBlock, Environment, Realm, Return};
 use crate::html::{esc, json_str};
 use crate::markdown;
 use crate::model::{Function, FunctionKind, Group, Module, ModuleKind, Project};
@@ -274,11 +274,12 @@ fn project_index(project: &Project) -> String {
 fn module_list(project: &Project, root: &str, group: &Group) -> String {
     let mut out = String::from("<div class=\"module-list\">\n");
     for m in &group.modules {
-        let _ = writeln!(out, "<div class=\"summary-row\"><div class=\"summary-signature\"><a href=\"{root}{dir}/{slug}.html\">{title}</a> <span class=\"badge badge-{badge}\">{badge}</span></div><div class=\"summary-synopsis\">{desc}</div></div>",
+        let _ = writeln!(out, "<div class=\"summary-row\"><div class=\"summary-signature\"><a href=\"{root}{dir}/{slug}.html\">{title}</a> <span class=\"badge badge-{badge}\">{badge}</span>{env}</div><div class=\"summary-synopsis\">{desc}</div></div>",
             dir = group.dir,
             slug = m.slug,
             title = esc(&m.title),
             badge = m.kind.badge(),
+            env = m.environment().map(environment_flag).unwrap_or_default(),
             desc = md_inline(project, root, &m.summary()),
         );
     }
@@ -317,10 +318,11 @@ fn module_page(project: &Project, group: &Group, m: &Module) -> String {
 
     let _ = write!(
         body,
-        "<div class=\"page-header\"><h1>{} <span class=\"badge badge-{badge}\">{badge}</span>{realm}</h1>",
+        "<div class=\"page-header\"><h1>{} <span class=\"badge badge-{badge}\">{badge}</span>{realm}{env}</h1>",
         esc(&m.title),
         badge = m.kind.badge(),
         realm = module_realm(m).map(realm_pill).unwrap_or_default(),
+        env = m.environment().map(environment_flag).unwrap_or_default(),
     );
     let (subtitle, lead) = if m.kind == ModuleKind::Hooks { (None, m.subtitle.as_ref()) } else { (m.subtitle.as_ref(), None) };
     if let Some(sub) = subtitle {
@@ -385,9 +387,17 @@ fn module_page(project: &Project, group: &Group, m: &Module) -> String {
     layout(project, &path, &m.title, Active { group_dir: Some(&group.dir), module_slug: Some(&m.slug) }, &body)
 }
 
+/// The pill of an `@environment` tag, such as `development`.
+fn environment_flag(env: &Environment) -> String {
+    format!(" <span class=\"flag flag-environment\" title=\"{}\">{}</span>", esc(&env.title()), esc(&env.name))
+}
+
 fn flags(f: &Function) -> String {
     let mut out = String::new();
     if let Some(doc) = &f.doc {
+        if let Some(env) = &doc.environment {
+            out.push_str(&environment_flag(env));
+        }
         if doc.is_deprecated() {
             out.push_str(" <span class=\"flag flag-deprecated\">deprecated</span>");
         }
@@ -438,6 +448,7 @@ fn function_detail(project: &Project, root: &str, f: &Function) -> String {
             }
         }
     }
+    out.push_str(&otherwise_block(project, root, f));
     if f.kind == FunctionKind::Hook {
         if !f.callers.is_empty() {
             out.push_str("<h4>Called from</h4>\n<ul class=\"callers\">");
@@ -451,6 +462,41 @@ fn function_detail(project: &Project, root: &str, f: &Function) -> String {
         out.push_str(&sources_list("Defined in", project, f));
     }
     out.push_str("</section>\n</section>\n");
+    out
+}
+
+/// What the `else` arm definition of a branch twin does: its description,
+/// without the first paragraph when that is the primary definition's, and
+/// its parameters when they differ from the primary definition's.
+/// Under `@environment`, the admonition already names the condition.
+fn otherwise_block(project: &Project, root: &str, f: &Function) -> String {
+    let Some(other) = &f.otherwise else { return String::new() };
+    let environment = f.doc.as_ref().is_some_and(|d| d.environment.is_some());
+    let title = if environment { "In other environments" } else { "Otherwise" };
+    let mut out = format!("<div class=\"otherwise\"><p class=\"otherwise-title\">{title} {}</p>\n", source_link(project, &other.file, other.line));
+    if !environment {
+        let _ = writeln!(out, "<p>When <code>{}</code> does not hold:</p>", esc(&other.condition));
+    }
+    match &other.doc {
+        Some(doc) => {
+            let primary = f.doc.as_ref();
+            let (lead, rest) = split_first_paragraph(&doc.description);
+            let description = match primary.map(|p| &p.description) {
+                Some(d) if *d == doc.description => String::new(),
+                Some(d) if split_first_paragraph(d).0 == lead => rest,
+                _ => doc.description.clone(),
+            };
+            if !description.is_empty() {
+                out.push_str(&md(project, root, &description));
+            }
+            if !doc.params.is_empty() && primary.is_none_or(|p| p.params != doc.params) {
+                out.push_str("<h4>Parameters</h4>\n");
+                out.push_str(&params_list(project, root, &doc.params));
+            }
+        }
+        None => out.push_str("<p class=\"muted\">No documentation available.</p>\n"),
+    }
+    out.push_str("</div>\n");
     out
 }
 
@@ -520,6 +566,9 @@ fn returns_list(project: &Project, root: &str, returns: &[Return]) -> String {
 fn doc_body(project: &Project, root: &str, doc: &DocBlock, f: Option<&Function>) -> String {
     let mut out = String::new();
 
+    if let Some(env) = &doc.environment {
+        let _ = writeln!(out, "<div class=\"admonition environment\"><p class=\"admonition-title\">{}</p><p>{}</p></div>", esc(&env.title()), md_inline(project, root, &env.text()));
+    }
     if doc.is_deprecated() {
         out.push_str("<div class=\"admonition deprecated\"><p class=\"admonition-title\">Deprecated");
         if let Some(v) = &doc.deprecation_version {
@@ -770,5 +819,78 @@ mod tests {
         assert!(data.contains("\"t\":\"A:do_x(n)\""));
         assert!(data.contains("\"t\":\"A:on_server()\",\"k\":\"function\",\"r\":\"flux/A.html#on_server\",\"d\":\"\",\"g\":\"A\",\"rl\":\"server\"}"), "{data}");
         assert!(data.contains("\"t\":\"Spawned(self, 1)\",\"k\":\"hook\""), "{data}");
+    }
+
+    #[test]
+    fn renders_environments_and_branch_twins() {
+        let files = vec![
+            (
+                "lib/sh_debug.lua".to_string(),
+                scan(
+                    "if is_development then
+  --- Prints a metric.
+  -- @environment [development]
+  -- @param id [String metric name]
+  -- @param format='{id}' [String message]
+  function print_metric(id, format) end
+  --- Adds a metric.
+  -- @param id [String metric name]
+  function add_metric(id) end
+else
+  --- Does nothing, since metrics are only collected in development.
+  -- @param id [String metric name]
+  -- @param format=nil [String message]
+  function print_metric(id, format) end
+  --- Adds a metric.
+  -- @param id [String metric name]
+  function add_metric(id) end
+end
+if is_development then
+  --- Resets the metrics.
+  --
+  -- Clears every list.
+  function reset() end
+else
+  --- Resets the metrics.
+  --
+  -- Does nothing here.
+  function reset() end
+end",
+                ),
+            ),
+            ("lib/sh_seed.lua".to_string(), scan("--- Seeds the database.\n-- @env [production] Skipped when `SEED` is set.\n\nfunction Seed.run() end")),
+        ];
+        let layout = Layout::default_for("Test");
+        let meta = HashMap::new();
+        let project = build(placed(&layout, files), BuildOptions { title: Some("Test"), ..BuildOptions::new(&layout, &meta) });
+        let pages = render_all(&project);
+        let page = |path: &str| pages.iter().find(|p| p.path == path).map(|p| p.content.as_str()).unwrap_or_else(|| panic!("no page {path}"));
+
+        let globals = page("flux/Globals.html");
+        assert_eq!(globals.matches("<section class=\"detail\"").count(), 3, "{globals}");
+        let pill = "<span class=\"flag flag-environment\" title=\"Development only\">development</span>";
+        assert!(globals.contains(&format!("print_metric(id, format)</a><span class=\"realm realm-shared\" title=\"Shared (server and client)\">shared</span> {pill}")), "{globals}");
+        let detail = &globals[globals.find("id=\"print_metric\"").unwrap()..];
+        assert!(detail.contains(&format!("shared</span> {pill}\n<a href=\"#print_metric\"")), "{detail}");
+        assert!(detail.contains("<section class=\"docstring\">\n<div class=\"admonition environment\"><p class=\"admonition-title\">Development only</p><p>Only available in the development environment.</p></div>\n<p>Prints a metric.</p>"), "{detail}");
+        let other = &detail[detail.find("<div class=\"otherwise\">").unwrap()..];
+        assert!(other.starts_with("<div class=\"otherwise\"><p class=\"otherwise-title\">In other environments <span class=\"source-link\">lib/sh_debug.lua:14</span></p>\n<p>Does nothing, since metrics are only collected in development.</p>\n<h4>Parameters</h4>"), "{other}");
+        assert!(!other[..other.find("</div>").unwrap()].contains("does not hold"), "{other}");
+        assert!(other.contains("<h4>Defined in</h4>\n<ul class=\"source-list\"><li><span class=\"source-link\">lib/sh_debug.lua:6</span> <span class=\"realm realm-shared\""), "{other}");
+        assert!(other.contains("<li><span class=\"source-link\">lib/sh_debug.lua:14</span> <span class=\"realm realm-shared\""), "{other}");
+
+        let add = &globals[globals.find("id=\"add_metric\"").unwrap()..];
+        let other = &add[add.find("<div class=\"otherwise\">").unwrap()..];
+        assert!(other.starts_with("<div class=\"otherwise\"><p class=\"otherwise-title\">Otherwise <span class=\"source-link\">lib/sh_debug.lua:17</span></p>\n<p>When <code>is_development</code> does not hold:</p>\n</div>"), "identical docs are not repeated: {other}");
+
+        let reset = &globals[globals.find("id=\"reset\"").unwrap()..];
+        let other = &reset[reset.find("<div class=\"otherwise\">").unwrap()..];
+        assert!(other.contains("does not hold:</p>\n<p>Does nothing here.</p>\n</div>"), "a repeated summary paragraph is left out: {other}");
+
+        let seed = page("flux/Seed.html");
+        assert!(seed.contains("<h1>Seed <span class=\"badge badge-library\">library</span> <span class=\"flag flag-environment\" title=\"Production only\">production</span></h1>"), "{seed}");
+        assert!(seed.contains("<p class=\"admonition-title\">Production only</p><p>Skipped when <code>SEED</code> is set.</p>"), "{seed}");
+        let index = page("index.html");
+        assert!(index.contains("Seed</a> <span class=\"badge badge-library\">library</span> <span class=\"flag flag-environment\" title=\"Production only\">production</span></div>"), "{index}");
     }
 }
