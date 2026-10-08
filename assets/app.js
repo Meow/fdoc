@@ -73,16 +73,25 @@
       '<div class="sidebar-row"><a href="' + escapeHtml(pageUrl(group.d, m.s)) + '">' + escapeHtml(m.t) + '</a></div></li>';
   }
 
+  // A non-clickable label row with the number of entries under it.
+  function headingHtml(label, count) {
+    return '<li class="sidebar-heading"><span class="sidebar-heading-label">' + escapeHtml(label) + '</span>' +
+      '<span class="sidebar-heading-count">' + count + '</span></li>';
+  }
+
   // A group's modules: code first, then each kind of definition under a
-  // heading (`k` is the kind's plural label, such as "Commands").
+  // heading (`k` is the kind's plural label, such as "Commands"). The code
+  // modules get a "Modules" heading only when the group has definitions.
   function modulesHtml(group) {
+    var counts = {};
+    group.m.forEach(function (m) { counts[m.k || ''] = (counts[m.k || ''] || 0) + 1; });
+    var labelled = group.m.some(function (m) { return m.k; });
     var html = '';
-    var kind = '';
+    var kind = null;
     group.m.forEach(function (m) {
-      if (m.k && m.k !== kind) {
-        kind = m.k;
-        html += '<li class="sidebar-heading">' + escapeHtml(kind) + '</li>';
-      }
+      var k = m.k || '';
+      if (labelled && k !== kind) html += headingHtml(k || 'Modules', counts[k]);
+      kind = k;
       html += moduleHtml(group, m);
     });
     return html;
