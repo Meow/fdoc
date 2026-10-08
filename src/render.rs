@@ -546,7 +546,9 @@ fn truncate(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::layout::Layout;
     use crate::model::{build, BuildOptions};
+    use std::collections::HashMap;
     use crate::scanner::scan;
 
     #[test]
@@ -554,7 +556,9 @@ mod tests {
         let files = vec![
             ("lib/a.lua".to_string(), scan("--- Class A.\nclass 'A'\n--- Does x.\n-- @param n=1 [Number count]\n-- @return [Boolean ok]\n-- @see [A#other]\nfunction A:do_x(n)\nend\nfunction A:other() end")),
         ];
-        let project = build(files, BuildOptions { title: Some("Test"), fallback_title: None, documented_only: false, source_url: Some("https://example.com/") });
+        let layout = Layout::default_for("Test");
+        let meta = HashMap::new();
+        let project = build(files, BuildOptions { title: Some("Test"), source_url: Some("https://example.com/"), ..BuildOptions::new(&layout, &meta) });
         let pages = render_all(&project);
         let paths: Vec<&str> = pages.iter().map(|p| p.path.as_str()).collect();
         assert!(paths.contains(&"index.html") && paths.contains(&"flux/A.html") && paths.contains(&"assets/search_data.js"));

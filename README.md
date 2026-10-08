@@ -16,9 +16,10 @@ cargo build --release
 | Option | Effect |
 | --- | --- |
 | `-o, --output <DIR>` | Output directory (default: `<SOURCE_DIR>/docs`) |
-| `--title <NAME>` | Project name (default: the `name` in `packagespec.lua`, else the directory name) |
+| `--config <FILE>` | Layout and project settings (default: `<SOURCE_DIR>/.fdoc.yml` if it exists); see [below](#configuration) |
+| `--title <NAME>` | Project name (default: the config's `title`, else the `name` in `packagespec.lua`, else the directory name) |
 | `--source-url <URL>` | Base URL that source paths are appended to for "view source" links |
-| `--exclude <NAME>` | Directory name to skip; repeatable (default: `docs`, `.git`) |
+| `--exclude <NAME>` | Directory name, or path relative to the source directory, to skip; repeatable (default: `docs`, `.git`) |
 | `--documented-only` | Only include functions that have a doc comment |
 | `--clean` | Delete the output directory before generating |
 | `-q, --quiet` | Only print errors |
@@ -41,12 +42,92 @@ python3 -m http.server --directory path/to/docs
 
 ## Layout of the generated documentation
 
-Files are grouped by where they live in the source tree:
+The documentation is split into sections, shown as tabs in the sidebar, and
+each section into groups of source files. A core group has no index page of
+its own: its modules are listed directly under the section. Every other group
+(a package or a plugin) gets an index page with its description, author and
+version.
 
-- `packages/<name>/...` becomes a package, named after its `packagespec.lua`;
-- `plugins/<name>/...` and `plugins/<file>.lua` become plugins, named through
-  `PLUGIN:set_name`;
-- everything else is the core of the project.
+Without a configuration file the layout follows Flux:
+
+- the project title is the section of the core, which holds every file not
+  claimed by a package or a plugin;
+- `packages/<name>/...` becomes a group in the "Packages" section, named after
+  its `packagespec.lua`;
+- `plugins/<name>/...` and `plugins/<file>.lua` become groups in the "Plugins"
+  section, named through `PLUGIN:set_name`.
+
+Sections without groups are left out.
+
+### Configuration
+
+Other layouts are described in a `.fdoc.yml` file in the source directory, or
+the file given with `--config`. All keys are optional; command line options
+take precedence over the file. For example, for Catwork, a
+Clockwork-derived gamemode:
+
+```yaml
+title: Catwork                 # same as --title
+version: "0.95"
+summary: One-line project summary shown on the index page.
+description: |
+  Longer Markdown description for the index page.
+source_url: https://github.com/Meow/Catwork/blob/master/   # same as --source-url
+exclude:                       # added to --exclude
+  - thirdparty
+documented_only: false         # same as --documented-only
+sections:                      # sidebar tabs, in order
+  - title: Catwork
+    groups:
+      - path: gamemodes/catwork/gamemode   # one group from this directory
+        name: Catwork                      # fixed title
+        core: true                         # modules listed directly under the section
+  - title: Plugins
+    groups:
+      - path: gamemodes/catwork/plugins/*      # one group per directory
+      - path: gamemodes/catwork/plugins/*.lua  # and one per file
+  - title: HL2RP
+    groups:
+      - path: gamemodes/cwhl2rp/schema
+        name: HL2RP
+        core: true
+  - title: HL2RP Plugins
+    groups:
+      - path: gamemodes/cwhl2rp/plugins/*
+```
+
+An `exclude` entry without a `/` skips every directory of that name; one with
+a `/` skips that path, relative to the source directory.
+
+A group `path` is relative to the source directory. A `*` component matches
+any directory and makes one group per match; `*.lua` as the last component
+matches any file and makes one group per file. `.` is the whole source tree.
+When a file matches several paths, the one with the most components that are
+not wildcards wins, and `.` loses to all others. Files that match no path are
+left out of the documentation, and their number is reported. A group directory
+and a file of the same name in one section, such as `plugins/stamina/` and
+`plugins/stamina.lua`, form one group.
+
+A group's title is the first of:
+
+1. its `name` in the configuration;
+2. the `name` in a Clockwork-style `plugin.ini` in the group's directory
+   (`plugins/stamina/plugin.ini` for `plugins/*`), which also supplies the
+   description, the author and the version (`version`, else `compatibility`);
+3. the `name` in a `packagespec.lua` in the group's directory, which also
+   supplies the summary, the author and the version;
+4. the name given to `PLUGIN:set_name`, along with `PLUGIN:set_description`
+   and `PLUGIN:set_author`;
+5. the directory or file name that `*` matched.
+
+A core group is titled by its `name` or `plugin.ini`, else after its section.
+
+Pages are written to `<section>/` for the first core group of a section and to
+`<section>/<group>/` for the others, where `<section>` is the lower-cased
+section title. The default layout keeps Flux's directories: `flux/`,
+`packages/<name>/` and `plugins/<name>/`.
+
+### Modules
 
 Inside each group, functions are collected into modules by the table they are
 defined on: `function Foo.Bar:baz()` lands in `Foo.Bar`. Metatable locals such

@@ -4,6 +4,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::doc::DocBlock;
+use crate::layout::{GroupMeta, Layout, Placement};
 use crate::scanner::{Category, FileScan, Sep};
 
 /// Template objects that are redefined per file (`PANEL:Init`, ...), so
@@ -146,25 +147,24 @@ pub struct BuildOptions<'a> {
     pub title: Option<&'a str>,
     /// Name used when neither `title` nor a packagespec provides one.
     pub fallback_title: Option<&'a str>,
+    /// Explicit project version, summary and description; override the
+    /// packagespec.
+    pub version: Option<&'a str>,
+    pub summary: Option<&'a str>,
+    pub description: Option<&'a str>,
     pub documented_only: bool,
     pub source_url: Option<&'a str>,
+    /// Which files form which groups and sections.
+    pub layout: &'a Layout,
+    /// Metadata from `plugin.ini` files, by the group's output directory
+    /// (`Placement::dir`).
+    pub group_meta: &'a HashMap<String, GroupMeta>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-enum Kind {
-    Core,
-    Package,
-    Plugin,
-}
-
-/// Classifies a source path (relative to the source root, `/` separated).
-fn classify(path: &str) -> (Kind, String) {
-    let parts: Vec<&str> = path.split('/').collect();
-    match parts.as_slice() {
-        ["packages", name, _, ..] => (Kind::Package, name.to_string()),
-        ["plugins", name, _, ..] => (Kind::Plugin, name.to_string()),
-        ["plugins", file] => (Kind::Plugin, file.trim_end_matches(".lua").to_string()),
-        _ => (Kind::Core, String::new()),
+impl<'a> BuildOptions<'a> {
+    /// Options with nothing set apart from the layout and group metadata.
+    pub fn new(layout: &'a Layout, group_meta: &'a HashMap<String, GroupMeta>) -> BuildOptions<'a> {
+        BuildOptions { title: None, fallback_title: None, version: None, summary: None, description: None, documented_only: false, source_url: None, layout, group_meta }
     }
 }
 
@@ -186,32 +186,49 @@ struct GroupBuilder {
     files: Vec<(String, FileScan)>,
 }
 
-pub fn build(files: Vec<(String, FileScan)>, opts: BuildOptions) -> Project {
-    // Project metadata from the root packagespec.
-    let mut title = opts.title.map(str::to_string);
-    let mut version = None;
-    let mut summary = None;
-    let mut description = None;
-    for (path, scan) in &files {
-        if path == "packagespec.lua" {
-            for (k, v) in &scan.spec {
-                match k.as_str() {
-                    "name" => title.get_or_insert_with(|| v.clone()),
-                    "version" => version.get_or_insert_with(|| v.clone()),
-                    "summary" => summary.get_or_insert_with(|| v.clone()),
-                    "description" => description.get_or_insert_with(|| v.clone()),
-                    _ => continue,
-                };
-            }
-        }
-    }
-    let title = title.or_else(|| opts.fallback_title.map(str::to_string)).unwrap_or_else(|| "Documentation".to_string());
+/// The first value of `key` in the root `packagespec.lua`.
+fn root_spec(files: &[(String, FileScan)], key: &str) -> Option<String> {
+    files.iter().filter(|(path, _)| path == "packagespec.lua").flat_map(|(_, scan)| &scan.spec).find(|(k, _)| k == key).map(|(_, v)| v.clone())
+}
 
-    // Gather files per group.
-    let mut groups: BTreeMap<(Kind, String), GroupBuilder> = BTreeMap::new();
+/// The project name: `title`, else the root packagespec's name, else
+/// `fallback`.
+pub fn project_title(files: &[(String, FileScan)], title: Option<&str>, fallback: Option<&str>) -> String {
+    title.map(str::to_string).or_else(|| root_spec(files, "name")).or_else(|| fallback.map(str::to_string)).unwrap_or_else(|| "Documentation".to_string())
+}
+
+/// Metadata of a group's own `packagespec.lua`.
+fn package_meta(scan: &FileScan) -> GroupMeta {
+    let mut meta = GroupMeta::default();
+    for (k, v) in &scan.spec {
+        let slot = match k.as_str() {
+            "name" => &mut meta.name,
+            "summary" | "description" => &mut meta.description,
+            "author" => &mut meta.author,
+            "version" => &mut meta.version,
+            _ => continue,
+        };
+        slot.get_or_insert_with(|| v.clone());
+    }
+    meta
+}
+
+pub fn build(files: Vec<(String, FileScan)>, opts: BuildOptions) -> Project {
+    let title = project_title(&files, opts.title, opts.fallback_title);
+    let version = opts.version.map(str::to_string).or_else(|| root_spec(&files, "version"));
+    let summary = opts.summary.map(str::to_string).or_else(|| root_spec(&files, "summary"));
+    let description = opts.description.map(str::to_string).or_else(|| root_spec(&files, "description"));
+    let layout = opts.layout;
+
+    // Gather files per group, keyed by output directory. `PLUGIN:set_*`
+    // calls fill the builder; the group's own packagespec is kept aside.
+    let mut groups: BTreeMap<String, (Placement, GroupMeta, GroupBuilder)> = BTreeMap::new();
     for (path, scan) in files {
-        let (kind, key) = classify(&path);
-        let g = groups.entry((kind, key.clone())).or_insert_with(|| GroupBuilder { key: key.clone(), name: None, description: None, author: None, version: None, plugin_global: None, files: Vec::new() });
+        let Some(place) = layout.classify(&path) else { continue };
+        let (place, spec, g) = groups.entry(place.dir.clone()).or_insert_with(|| {
+            let g = GroupBuilder { key: place.key.clone(), name: None, description: None, author: None, version: None, plugin_global: None, files: Vec::new() };
+            (place, GroupMeta::default(), g)
+        });
         if let Some(n) = &scan.plugin_name {
             g.name.get_or_insert(n.clone());
         }
@@ -224,51 +241,48 @@ pub fn build(files: Vec<(String, FileScan)>, opts: BuildOptions) -> Project {
         if let Some(gl) = &scan.plugin_global {
             g.plugin_global.get_or_insert(gl.clone());
         }
-        if kind == Kind::Package && file_stem(&path) == "packagespec" {
-            for (k, v) in &scan.spec {
-                match k.as_str() {
-                    "name" => g.name.get_or_insert(v.clone()),
-                    "summary" => g.description.get_or_insert(v.clone()),
-                    "description" => {
-                        if g.description.is_none() {
-                            g.description.get_or_insert(v.clone())
-                        } else {
-                            continue;
-                        }
-                    }
-                    "author" => g.author.get_or_insert(v.clone()),
-                    "version" => g.version.get_or_insert(v.clone()),
-                    _ => continue,
-                };
-            }
+        if !place.core && path == format!("{}/packagespec.lua", place.source_dir) {
+            *spec = package_meta(&scan);
         }
         g.files.push((path, scan));
     }
 
-    let mut sections: Vec<Section> = vec![
-        Section { title: title.clone(), groups: Vec::new() },
-        Section { title: "Packages".to_string(), groups: Vec::new() },
-        Section { title: "Plugins".to_string(), groups: Vec::new() },
-    ];
+    let mut sections: Vec<Section> = layout.sections.iter().map(|s| Section { title: s.title.clone(), groups: Vec::new() }).collect();
+    let mut placed: Vec<(Placement, Group)> = Vec::new();
+    let mut dirs: HashSet<String> = HashSet::new();
+    for (place, spec, mut gb) in groups.into_values() {
+        // Name priority: the layout, plugin.ini, packagespec, `PLUGIN:set_name`,
+        // the path. Core groups are named after their section instead.
+        let fixed = layout.group(&place).name.clone();
+        let ini = opts.group_meta.get(&place.dir).cloned().unwrap_or_default();
+        let section_title = &layout.sections[place.section].title;
+        let group_title = if place.core {
+            let title = fixed.clone().or(ini.name.clone()).unwrap_or_else(|| section_title.clone());
+            gb.name = fixed.clone().or(ini.name.clone()).or(gb.name);
+            title
+        } else {
+            gb.name = fixed.or(ini.name).or(spec.name).or(gb.name);
+            gb.name.clone().unwrap_or_else(|| if place.key.is_empty() { section_title.clone() } else { place.short_name().to_string() })
+        };
+        gb.description = ini.description.or(spec.description).or(gb.description);
+        gb.author = ini.author.or(spec.author).or(gb.author);
+        gb.version = ini.version.or(spec.version).or(gb.version);
 
-    for ((kind, key), gb) in groups {
-        let dir = match kind {
-            Kind::Core => "flux".to_string(),
-            Kind::Package => format!("packages/{}", slugify(&key)),
-            Kind::Plugin => format!("plugins/{}", slugify(&key)),
-        };
-        let group_title = match kind {
-            Kind::Core => title.clone(),
-            _ => gb.name.clone().unwrap_or_else(|| key.clone()),
-        };
         let modules = build_modules(&gb, &group_title, opts.documented_only);
-        let group = Group { title: group_title, description: gb.description.clone(), author: gb.author.clone(), version: gb.version.clone(), dir, modules, is_core: kind == Kind::Core };
-        let idx = match kind {
-            Kind::Core => 0,
-            Kind::Package => 1,
-            Kind::Plugin => 2,
-        };
-        sections[idx].groups.push(group);
+        // Output directories must also differ on case-insensitive file systems.
+        let mut dir = place.dir.clone();
+        let mut n = 1;
+        while !dirs.insert(dir.to_ascii_lowercase()) {
+            n += 1;
+            dir = format!("{}-{n}", place.dir);
+        }
+        let group = Group { title: group_title, description: gb.description, author: gb.author, version: gb.version, dir, modules, is_core: place.core };
+        placed.push((place, group));
+    }
+    // Core groups first, then by key.
+    placed.sort_by(|(a, _), (b, _)| b.core.cmp(&a.core).then_with(|| a.key.to_ascii_lowercase().cmp(&b.key.to_ascii_lowercase())).then_with(|| a.dir.cmp(&b.dir)));
+    for (place, group) in placed {
+        sections[place.section].groups.push(group);
     }
     sections.retain(|s| !s.groups.is_empty());
 
@@ -531,7 +545,9 @@ mod tests {
 
     #[test]
     fn builds_sections_and_modules() {
-        let p = build(files(), BuildOptions { title: None, fallback_title: Some("fallback"), documented_only: false, source_url: None });
+        let layout = Layout::default_for("Flux");
+        let meta = HashMap::new();
+        let p = build(files(), BuildOptions { fallback_title: Some("fallback"), ..BuildOptions::new(&layout, &meta) });
         assert_eq!(p.title, "Flux");
         assert_eq!(p.version.as_deref(), Some("1.0"));
         assert_eq!(p.sections.len(), 3);
@@ -562,8 +578,47 @@ mod tests {
     }
 
     #[test]
+    fn groups_by_configured_layout() {
+        let config = crate::layout::Config::from_yaml(
+            "sections:
+  - title: Catwork
+    groups:
+      - { path: gm/gamemode, core: true }
+  - title: Plugins
+    groups:
+      - path: gm/plugins/*
+      - path: gm/plugins/*.lua
+",
+        )
+        .unwrap();
+        let layout = config.layout.unwrap();
+        let mut meta = HashMap::new();
+        meta.insert("plugins/stamina".to_string(), GroupMeta { name: Some("Stamina".into()), description: None, author: Some("kurozael".into()), version: Some("0.93".into()) });
+        let files = vec![
+            ("gm/gamemode/core/sh_kernel.lua".to_string(), scan("function Kernel.Init() end")),
+            ("gm/plugins/stamina/plugin/sh_plugin.lua".to_string(), scan("PLUGIN:set_name('Ignored')\nPLUGIN:set_description('From code.')\nfunction PLUGIN:Think() end")),
+            ("gm/plugins/sh_raisegun.lua".to_string(), scan("function PLUGIN:Think() end")),
+            ("gm/other/x.lua".to_string(), scan("function x() end")),
+        ];
+        let p = build(files, BuildOptions { title: Some("Catwork"), ..BuildOptions::new(&layout, &meta) });
+        let sections: Vec<&str> = p.sections.iter().map(|s| s.title.as_str()).collect();
+        assert_eq!(sections, vec!["Catwork", "Plugins"]);
+        let core = &p.sections[0].groups[0];
+        assert_eq!((core.title.as_str(), core.dir.as_str(), core.is_core), ("Catwork", "catwork", true));
+        let plugins: Vec<(&str, &str)> = p.sections[1].groups.iter().map(|g| (g.title.as_str(), g.dir.as_str())).collect();
+        assert_eq!(plugins, vec![("sh_raisegun", "plugins/sh_raisegun"), ("Stamina", "plugins/stamina")]);
+        let stamina = &p.sections[1].groups[1];
+        assert_eq!((stamina.description.as_deref(), stamina.author.as_deref(), stamina.version.as_deref()), (Some("From code."), Some("kurozael"), Some("0.93")));
+        assert_eq!(stamina.modules[0].id, "Stamina");
+        assert_eq!(p.resolve("Kernel.Init").as_deref(), Some("catwork/Kernel.html#Init"));
+        assert_eq!(p.resolve("x"), None, "files outside every group are skipped");
+    }
+
+    #[test]
     fn resolves_references() {
-        let p = build(files(), BuildOptions { title: None, fallback_title: Some("fallback"), documented_only: false, source_url: None });
+        let layout = Layout::default_for("Flux");
+        let meta = HashMap::new();
+        let p = build(files(), BuildOptions { fallback_title: Some("fallback"), ..BuildOptions::new(&layout, &meta) });
         assert_eq!(p.resolve("Core::A#other").as_deref(), Some("flux/Core.A.html#other"));
         assert_eq!(p.resolve("Core.A:do_x").as_deref(), Some("flux/Core.A.html#do_x"));
         assert_eq!(p.resolve("Core.A").as_deref(), Some("flux/Core.A.html"));
