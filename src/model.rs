@@ -1,15 +1,24 @@
 //! Builds the documentation model (sections, groups, modules, functions)
 //! from the scanned files, and the cross-reference index used for links.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
-use crate::doc::DocBlock;
+use crate::doc::{DocBlock, Realm};
 use crate::layout::{GroupMeta, Layout, Placement};
-use crate::scanner::{Category, FileScan, Sep};
+use crate::scanner::{path_realm, Category, FileScan, FunctionDecl, Sep};
 
-/// Template objects that are redefined per file (`PANEL:Init`, ...), so
-/// each file becomes its own module.
+/// Template objects that the loader injects as globals and redefines per
+/// file (`PANEL:Init`, `ENT:Think`, ...), so each file becomes its own module.
+/// Objects declared as file locals are recognised from the declaration
+/// instead, see `is_object_init`.
 const PER_FILE_OBJECTS: [&str; 14] = ["PANEL", "CMD", "SKIN", "THEME", "TOOL", "ENT", "SWEP", "EFFECT", "ROLE", "PACKAGE", "ITEM", "ATTRIBUTE", "FACTION", "CONDITION"];
+
+/// File names of an entity, weapon or effect folder; the files of one folder
+/// form one module.
+const ENTITY_FILES: [&str; 3] = ["init.lua", "cl_init.lua", "shared.lua"];
+
+/// Fields that give an object its display title, in order of preference.
+const TITLE_FIELDS: [&str; 4] = ["PrintName", "name", "Name", "title"];
 
 /// Conventional names for metatable locals when the file does not declare them.
 const META_NAMES: [(&str, &str); 12] = [
@@ -31,9 +40,16 @@ const META_NAMES: [(&str, &str); 12] = [
 pub enum ModuleKind {
     Class { extends: Option<String> },
     Library,
+    /// The hooks a group runs (`hook.Run`, `hook.Call`, `Plugin.call`, ...),
+    /// one function per hook name.
     Hooks,
+    /// A table whose methods handle hooks. `object` is `GM`, `PLUGIN` (a
+    /// plugin, under its global alias when it has one), `Schema`, or
+    /// `hook.Add` for the handlers added by files without such a table.
+    Handlers { object: String },
     Globals,
-    /// A per-file template object such as a `PANEL`.
+    /// A per-file template object such as a `PANEL`, or a file-local object
+    /// table; `object` is the name it is written as in the code.
     Object { object: String },
 }
 
@@ -43,24 +59,63 @@ impl ModuleKind {
             ModuleKind::Class { .. } => "class",
             ModuleKind::Library => "library",
             ModuleKind::Hooks => "hooks",
+            ModuleKind::Handlers { object } => match object.as_str() {
+                "GM" => "gamemode",
+                "Schema" => "schema",
+                "hook.Add" => "handlers",
+                _ => "plugin",
+            },
             ModuleKind::Globals => "globals",
             ModuleKind::Object { .. } => "object",
         }
     }
 }
 
+/// Where a `Function` comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FunctionKind {
+    /// A `function` declaration or `name = function` assignment.
+    Declared,
+    /// A hook the code runs, built from its call sites (in a `Hooks` module).
+    Hook,
+    /// A handler added with `hook.Add`.
+    HookAdd,
+}
+
 #[derive(Debug, Clone)]
 pub struct Function {
     pub name: String,
-    /// Display owner, e.g. `ActiveRecord.Base`; empty for globals.
+    /// Display owner, e.g. `ActiveRecord.Base`; empty for globals, hooks and
+    /// `hook.Add` handlers.
     pub owner: String,
     pub sep: Sep,
     pub params: Vec<String>,
     pub doc: Option<DocBlock>,
+    /// Primary location: the shared definition, else the server one.
     pub file: String,
     pub line: usize,
     pub anchor: String,
     pub category: String,
+    pub kind: FunctionKind,
+    /// Where it runs: the `@realm` tag, else the enclosing `if SERVER` /
+    /// `if CLIENT` block, else the file path. Server and client twins merged
+    /// into one function are `Shared`.
+    pub realm: Realm,
+    /// Every definition (file, line, realm), the primary one first. More
+    /// than one for merged realm twins; every call site for a hook.
+    pub sources: Vec<(String, usize, Realm)>,
+    /// The client definition's doc of a merged twin, when it differs from
+    /// `doc`.
+    pub client_doc: Option<DocBlock>,
+    /// For hooks: the functions that run it, qualified as they are
+    /// documented (`Player:GetData`, `cw.core:Initialize`, `helper`).
+    pub callers: Vec<String>,
+    /// For `hook.Add` handlers: the identifier, when it is a string literal.
+    #[allow(dead_code)]
+    pub hook_id: Option<String>,
+    /// For functions in the `Hooks` category: the reference key (`hook:Name`)
+    /// of the hook of that name the project runs, if any.
+    pub implements: Option<String>,
 }
 
 impl Function {
@@ -172,17 +227,37 @@ fn file_stem(path: &str) -> String {
     path.rsplit('/').next().unwrap_or(path).trim_end_matches(".lua").to_string()
 }
 
+/// The file stem without its `sv_`, `cl_` or `sh_` realm prefix.
+fn bare_stem(path: &str) -> String {
+    let stem = file_stem(path);
+    for prefix in ["sv_", "cl_", "sh_"] {
+        if let Some(rest) = stem.strip_prefix(prefix).filter(|r| !r.is_empty()) {
+            return rest.to_string();
+        }
+    }
+    stem
+}
+
+/// The name of the directory a file is in, if any.
+fn parent_dir(path: &str) -> Option<&str> {
+    let mut parts = path.rsplit('/');
+    parts.next();
+    parts.next()
+}
+
 pub fn slugify(id: &str) -> String {
     id.chars().map(|c| if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') { c } else { '_' }).collect()
 }
 
 struct GroupBuilder {
-    key: String,
     name: Option<String>,
     description: Option<String>,
     author: Option<String>,
     version: Option<String>,
     plugin_global: Option<String>,
+    /// The group's directory in the source tree; module subtitles show file
+    /// paths relative to it.
+    source_dir: String,
     files: Vec<(String, FileScan)>,
 }
 
@@ -221,22 +296,25 @@ pub fn build(files: Vec<(String, FileScan)>, opts: BuildOptions) -> Project {
     let layout = opts.layout;
 
     // Gather files per group, keyed by output directory. `PLUGIN:set_*`
-    // calls fill the builder; the group's own packagespec is kept aside.
+    // calls and `PLUGIN.name = ...` fields fill the builder; the group's own
+    // packagespec is kept aside.
     let mut groups: BTreeMap<String, (Placement, GroupMeta, GroupBuilder)> = BTreeMap::new();
+    let mut called: HashSet<String> = HashSet::new();
     for (path, scan) in files {
         let Some(place) = layout.classify(&path) else { continue };
         let (place, spec, g) = groups.entry(place.dir.clone()).or_insert_with(|| {
-            let g = GroupBuilder { key: place.key.clone(), name: None, description: None, author: None, version: None, plugin_global: None, files: Vec::new() };
+            let g = GroupBuilder { name: None, description: None, author: None, version: None, plugin_global: None, source_dir: place.source_dir.clone(), files: Vec::new() };
             (place, GroupMeta::default(), g)
         });
-        if let Some(n) = &scan.plugin_name {
-            g.name.get_or_insert(n.clone());
+        let plugin_field = |name: &str| scan.fields.iter().find(|(o, f, _)| o == "PLUGIN" && f == name).map(|(_, _, v)| v.clone());
+        if let Some(n) = scan.plugin_name.clone().or_else(|| plugin_field("name")) {
+            g.name.get_or_insert(n);
         }
-        if let Some(d) = &scan.plugin_description {
-            g.description.get_or_insert(d.clone());
+        if let Some(d) = scan.plugin_description.clone().or_else(|| plugin_field("description")) {
+            g.description.get_or_insert(d);
         }
-        if let Some(a) = &scan.plugin_author {
-            g.author.get_or_insert(a.clone());
+        if let Some(a) = scan.plugin_author.clone().or_else(|| plugin_field("author")) {
+            g.author.get_or_insert(a);
         }
         if let Some(gl) = &scan.plugin_global {
             g.plugin_global.get_or_insert(gl.clone());
@@ -244,6 +322,7 @@ pub fn build(files: Vec<(String, FileScan)>, opts: BuildOptions) -> Project {
         if !place.core && path == format!("{}/packagespec.lua", place.source_dir) {
             *spec = package_meta(&scan);
         }
+        called.extend(scan.hook_calls.iter().map(|c| c.name.clone()));
         g.files.push((path, scan));
     }
 
@@ -268,7 +347,7 @@ pub fn build(files: Vec<(String, FileScan)>, opts: BuildOptions) -> Project {
         gb.author = ini.author.or(spec.author).or(gb.author);
         gb.version = ini.version.or(spec.version).or(gb.version);
 
-        let modules = build_modules(&gb, &group_title, opts.documented_only);
+        let modules = build_modules(&gb, &group_title, opts.documented_only, &called);
         // Output directories must also differ on case-insensitive file systems.
         let mut dir = place.dir.clone();
         let mut n = 1;
@@ -304,10 +383,380 @@ fn resolve_owner(owner: &str, scan: &FileScan, plugin_global: &Option<String>) -
     owner
 }
 
-fn build_modules(gb: &GroupBuilder, group_title: &str, documented_only: bool) -> Vec<Module> {
-    // Module key -> module. Per-file objects are keyed by (object, file).
+/// Realm of a definition: its `@realm` tag, else the enclosing `if SERVER`
+/// / `if CLIENT` block, else the file path.
+fn definition_realm(doc: Option<&DocBlock>, block: Realm, path: &str) -> Realm {
+    doc.and_then(|d| d.realm).unwrap_or_else(|| match block {
+        Realm::Shared => path_realm(path),
+        specific => specific,
+    })
+}
+
+/// Which definition of realm twins is the primary one: shared, then server.
+fn realm_rank(realm: Realm) -> u8 {
+    match realm {
+        Realm::Shared => 0,
+        Realm::Server => 1,
+        Realm::Client => 2,
+    }
+}
+
+/// True when a method name looks like a hook: it starts with an upper case
+/// letter and is not all upper case (`PlayerSpawn`, not `pickup` or `OK`).
+fn is_hook_name(name: &str) -> bool {
+    name.chars().next().is_some_and(|c| c.is_ascii_uppercase()) && name.chars().any(|c| c.is_ascii_lowercase())
+}
+
+/// True when the right-hand side of a `local` creates an object: a table
+/// constructor, `setmetatable(...)`, a method call such as
+/// `cw.command:New('A')`, or a constructor-like call such as `item.New(...)`.
+/// Aliases (`PLUGIN`), field paths with defaults (`cw.currency.stored or {}`),
+/// literals and other expressions do not.
+fn is_object_init(init: &str) -> bool {
+    let init = init.trim();
+    if init.starts_with('{') {
+        return true;
+    }
+    let Some((path, args)) = split_call(init) else { return false };
+    if !is_whole_call(args) {
+        return false;
+    }
+    if path == "setmetatable" {
+        return true;
+    }
+    match path.rfind(['.', ':']) {
+        Some(p) if path[p..].starts_with(':') => true,
+        Some(p) => is_constructor_name(&path[p + 1..]),
+        None => false,
+    }
+}
+
+/// Splits a call such as `a.b:c(x)` into the callee path and the arguments
+/// from `(` on.
+fn split_call(init: &str) -> Option<(&str, &str)> {
+    let end = init.find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | ':')))?;
+    let (path, args) = init.split_at(end);
+    let first = path.chars().next()?;
+    ((first.is_ascii_alphabetic() || first == '_') && !path.ends_with(['.', ':']) && args.starts_with('(')).then_some((path, args))
+}
+
+/// True when `args` (from `(` on) is a single argument list with nothing
+/// after it, or is cut off by the scanner's length limit.
+fn is_whole_call(args: &str) -> bool {
+    let mut depth = 0i32;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (i, c) in args.char_indices() {
+        if in_string {
+            match c {
+                _ if escaped => escaped = false,
+                '\\' => escaped = true,
+                '\'' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+        match c {
+            '\'' => in_string = true,
+            '(' | '{' | '[' => depth += 1,
+            ')' | '}' | ']' => {
+                depth -= 1;
+                if depth == 0 {
+                    return args[i + c.len_utf8()..].trim().is_empty();
+                }
+            }
+            _ => {}
+        }
+    }
+    args.ends_with('…')
+}
+
+fn is_constructor_name(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    matches!(n.as_str(), "register" | "begin" | "define" | "extend" | "class") || n.starts_with("new") || n.starts_with("create")
+}
+
+/// The first argument of a constructor call when it is a string literal
+/// other than a language key: `cw.command:New('A')` -> `A`, but not
+/// `faction.New('#Faction_Admin')`.
+fn constructor_name(init: &str) -> Option<String> {
+    let (_, args) = split_call(init.trim())?;
+    let rest = args.strip_prefix("('")?;
+    let mut out = String::new();
+    let mut chars = rest.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => out.push(chars.next()?),
+            '\'' => return Some(out).filter(|s| !s.trim().is_empty() && !s.starts_with('#')),
+            c => out.push(c),
+        }
+    }
+    None
+}
+
+/// The display title an object's fields give it (`ENT.PrintName = 'Item'`),
+/// on one line, skipping language keys such as `#Item_Name`.
+fn title_field(scan: &FileScan, object: &str) -> Option<String> {
+    TITLE_FIELDS.iter().find_map(|field| {
+        scan.fields.iter().find(|(o, f, v)| o == object && f == field && !v.trim().is_empty() && !v.starts_with('#')).map(|(_, _, v)| v.split_whitespace().collect::<Vec<_>>().join(" "))
+    })
+}
+
+/// The object name used in generated ids: `CLASS_TABLE` -> `Class`,
+/// `PANEL` -> `Panel`, `ITEM_META` -> `ItemMeta`, `stored` -> `Stored`.
+fn object_word(local: &str) -> String {
+    let capitalize = |s: &str| {
+        let mut chars = s.chars();
+        chars.next().map(|c| c.to_uppercase().chain(chars).collect::<String>()).unwrap_or_default()
+    };
+    if local.chars().any(|c| c.is_ascii_lowercase()) {
+        return capitalize(local);
+    }
+    let name = local.strip_suffix("_TABLE").filter(|n| !n.is_empty()).unwrap_or(local);
+    name.split('_').map(|part| capitalize(&part.to_ascii_lowercase())).collect()
+}
+
+/// What an entity-style folder holds, by the object its files define.
+fn entity_label(object: &str) -> String {
+    match object {
+        "ENT" => "Entity".to_string(),
+        "SWEP" => "Weapon".to_string(),
+        "EFFECT" => "Effect".to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// True when the descriptions of two doc blocks match, ignoring `@realm`
+/// and `@category`.
+fn same_text(a: &DocBlock, b: &DocBlock) -> bool {
+    let strip = |d: &DocBlock| DocBlock { realm: None, category: None, ..d.clone() };
+    strip(a) == strip(b)
+}
+
+/// True when a doc block cannot document a module: its first line has no
+/// letters, such as an ASCII-art banner.
+fn is_banner(doc: &DocBlock) -> bool {
+    doc.description.lines().map(str::trim).find(|l| !l.is_empty()).is_none_or(|l| !l.chars().any(|c| c.is_ascii_alphabetic()))
+}
+
+/// The module a declaration lands in, and how to create it.
+#[derive(Clone)]
+struct Target {
+    /// Identity of the module inside the group.
+    key: String,
+    id: String,
+    title: String,
+    subtitle: Option<String>,
+    kind: ModuleKind,
+    doc: Option<DocBlock>,
+    decl_file: Option<(String, usize)>,
+}
+
+impl Target {
+    fn new(key: String, id: String, kind: ModuleKind) -> Target {
+        Target { key, title: id.clone(), id, subtitle: None, kind, doc: None, decl_file: None }
+    }
+
+    fn into_module(self) -> Module {
+        let mut m = new_module(&self.id, self.kind);
+        m.title = self.title;
+        m.subtitle = self.subtitle;
+        m.doc = self.doc;
+        m.decl_file = self.decl_file;
+        m
+    }
+}
+
+const HOOKS_KEY: &str = "\u{3}hooks";
+
+/// The handler module of `owner`; `object` is `GM`, `PLUGIN`, `Schema` or
+/// `hook.Add`.
+fn handler_target(owner: &str, object: &str, group_title: &str) -> Target {
+    let subtitle = match object {
+        "GM" => "Gamemode hooks".to_string(),
+        "Schema" => "Schema hooks and methods".to_string(),
+        "hook.Add" => format!("Hooks added by {group_title}"),
+        _ => "Plugin hooks and methods".to_string(),
+    };
+    let mut t = Target::new(format!("\u{1}handler\u{0}{}", owner.to_ascii_lowercase()), owner.to_string(), ModuleKind::Handlers { object: object.to_string() });
+    t.subtitle = Some(subtitle);
+    t
+}
+
+/// The handler object an owner stands for, if it is a hook table.
+fn handler_object(raw_owner: &str, owner: &str, plugin_global: &Option<String>, plugin_tables: &HashSet<String>) -> Option<&'static str> {
+    if owner == "GM" {
+        Some("GM")
+    } else if owner == "Schema" {
+        Some("Schema")
+    } else if raw_owner == "PLUGIN" || plugin_global.as_deref() == Some(owner) || plugin_tables.contains(owner) {
+        Some("PLUGIN")
+    } else {
+        None
+    }
+}
+
+/// Global tables of a group that look like plugin tables: they are given an
+/// `author` field.
+fn plugin_tables(gb: &GroupBuilder) -> HashSet<String> {
+    gb.files
+        .iter()
+        .flat_map(|(_, scan)| &scan.fields)
+        .filter(|(owner, field, _)| field == "author" && !owner.contains('.') && !PER_FILE_OBJECTS.contains(&owner.as_str()))
+        .map(|(owner, _, _)| owner.clone())
+        .collect()
+}
+
+/// True when a file refers to its plugin: `local PLUGIN = PLUGIN`,
+/// `PLUGIN:set_name(...)` or `PLUGIN.field = ...`.
+fn file_has_plugin(scan: &FileScan) -> bool {
+    scan.locals.iter().any(|l| l.name == "PLUGIN")
+        || scan.plugin_name.is_some()
+        || scan.plugin_description.is_some()
+        || scan.plugin_author.is_some()
+        || scan.plugin_global.is_some()
+        || scan.fields.iter().any(|(owner, _, _)| owner == "PLUGIN")
+}
+
+/// The modules of a file's object locals, by local index: locals whose
+/// initialiser creates an object (see `is_object_init`) and that functions
+/// are defined on. Objects are named by `@module`, `vgui.Register`, the
+/// constructor's string argument, else a template-style local (`PANEL`,
+/// `CLASS_TABLE`) gets an id from the file's library or name
+/// (`cw.currency.Class`) and any other local keeps its own name.
+fn local_objects(path: &str, rel: &str, scan: &FileScan, documented_only: bool) -> Vec<Option<Target>> {
+    let used: BTreeSet<usize> = scan
+        .functions
+        .iter()
+        .filter(|f| !documented_only || f.doc.is_some())
+        .filter_map(|f| f.local_table)
+        .filter(|&i| is_object_init(&scan.locals[i].init))
+        .collect();
+    let single = used.len() == 1 && scan.libraries.is_empty();
+    let mut out = vec![None; scan.locals.len()];
+    for &i in &used {
+        let local = &scan.locals[i];
+        let file_module = if single { scan.file_doc.as_ref().and_then(|d| d.module.clone()) } else { None };
+        let named = local.doc.as_ref().and_then(|d| d.module.clone()).or(file_module).or_else(|| local.register_name.clone()).or_else(|| constructor_name(&local.init));
+        let unique = scan.locals.iter().filter(|l| l.name == local.name).count() == 1;
+        let field_title = || unique.then(|| title_field(scan, &local.name)).flatten();
+        let template = !local.name.chars().any(|c| c.is_ascii_lowercase());
+        let (id, title) = match named {
+            Some(name) => (name.clone(), name),
+            None if !template => (local.name.clone(), field_title().unwrap_or_else(|| local.name.clone())),
+            None => {
+                let word = object_word(&local.name);
+                let id = match scan.libraries.first() {
+                    Some((library, _)) => format!("{library}.{word}"),
+                    None => format!("{}.{word}", bare_stem(path)),
+                };
+                let title = field_title().unwrap_or_else(|| id.clone());
+                (id, title)
+            }
+        };
+        out[i] = Some(Target {
+            key: format!("\u{2}object\u{0}{path}\u{0}{i:06}"),
+            id,
+            title,
+            subtitle: Some(format!("Object table {} in {rel}", local.name)),
+            kind: ModuleKind::Object { object: local.name.clone() },
+            doc: local.doc.clone(),
+            decl_file: Some((path.to_string(), local.line)),
+        });
+    }
+    out
+}
+
+/// The module a function on `owner` (already resolved) lands in when it is
+/// not defined on an object local.
+fn owner_target(gb: &GroupBuilder, group_title: &str, path: &str, scan: &FileScan, f: &FunctionDecl, owner: &str, plugin_tables: &HashSet<String>) -> Target {
+    let rel = rel_path(gb, path);
+    let first = owner.split('.').next().unwrap_or("");
+    if owner.is_empty() {
+        let mut t = Target::new("globals".to_string(), "Globals".to_string(), ModuleKind::Globals);
+        t.subtitle = Some(format!("Global functions of {group_title}"));
+        return t;
+    }
+    if PER_FILE_OBJECTS.contains(&first) {
+        let kind = ModuleKind::Object { object: first.to_string() };
+        let file = path.rsplit('/').next().unwrap_or(path);
+        if ENTITY_FILES.contains(&file)
+            && let Some(dir) = parent_dir(path)
+        {
+            let folder = &path[..path.len() - file.len() - 1];
+            let mut t = Target::new(format!("\u{2}entity\u{0}{first}\u{0}{folder}"), dir.to_string(), kind);
+            t.title = title_field(scan, first).unwrap_or_else(|| dir.to_string());
+            t.subtitle = Some(entity_label(first));
+            return t;
+        }
+        let id = if first == "PANEL" { scan.vgui_name.clone().unwrap_or_else(|| file_stem(path)) } else { file_stem(path) };
+        let mut t = Target::new(format!("\u{2}file\u{0}{first}\u{0}{path}"), id.clone(), kind);
+        t.title = title_field(scan, first).unwrap_or(id);
+        t.subtitle = Some(format!("Object {first} in {rel}"));
+        return t;
+    }
+    if let Some(object) = handler_object(&f.owner, owner, &gb.plugin_global, plugin_tables) {
+        return handler_target(owner, object, group_title);
+    }
+    Target::new(owner.to_ascii_lowercase(), owner.to_string(), ModuleKind::Library)
+}
+
+/// A path relative to the group's source directory.
+fn rel_path(gb: &GroupBuilder, path: &str) -> String {
+    path.strip_prefix(gb.source_dir.as_str()).and_then(|p| p.strip_prefix('/')).unwrap_or(path).to_string()
+}
+
+/// Adds the category to the module unless it has it, with the description
+/// the file gives it.
+fn ensure_category(m: &mut Module, name: &str, file_categories: &HashMap<&str, &Category>) {
+    if !m.categories.iter().any(|c| c.name == name) {
+        let description = file_categories.get(name).map(|c| c.description.clone()).unwrap_or_default();
+        m.categories.push(Category { name: name.to_string(), description });
+    }
+}
+
+/// Adds a declared function, merging it into a realm twin: a function of
+/// the same name defined for another realm.
+fn add_function(m: &mut Module, f: Function) {
+    let twin = m.functions.iter().position(|e| e.kind == FunctionKind::Declared && e.name == f.name && e.sep == f.sep && !e.sources.iter().any(|s| s.2 == f.realm));
+    match twin {
+        Some(i) => merge_twin(&mut m.functions[i], f),
+        None => m.functions.push(f),
+    }
+}
+
+/// Merges `f` into its twin `e`. The shared, else the server definition
+/// is the primary one; its doc wins, and a differing client doc is kept
+/// as `client_doc`.
+fn merge_twin(e: &mut Function, mut f: Function) {
+    if realm_rank(f.realm) < realm_rank(e.sources[0].2) {
+        std::mem::swap(e, &mut f);
+    }
+    let candidates = [(e.sources[0].2, e.doc.take()), (Realm::Client, e.client_doc.take()), (f.sources[0].2, f.doc.take()), (Realm::Client, f.client_doc.take())];
+    let mut docs: Vec<(Realm, DocBlock)> = candidates.into_iter().filter_map(|(r, d)| d.map(|d| (r, d))).collect();
+    docs.sort_by_key(|(r, _)| realm_rank(*r));
+    let mut docs = docs.into_iter();
+    e.doc = docs.next().map(|(_, d)| d);
+    e.client_doc = docs.find(|(r, d)| *r == Realm::Client && !e.doc.as_ref().is_some_and(|p| same_text(p, d))).map(|(_, d)| d);
+    e.sources.extend(f.sources);
+    e.realm = Realm::Shared;
+}
+
+/// Module order inside a group: the hooks page, hook handlers, globals,
+/// then everything else.
+fn module_rank(kind: &ModuleKind) -> u8 {
+    match kind {
+        ModuleKind::Hooks => 0,
+        ModuleKind::Handlers { .. } => 1,
+        ModuleKind::Globals => 2,
+        _ => 3,
+    }
+}
+
+fn build_modules(gb: &GroupBuilder, group_title: &str, documented_only: bool, called: &HashSet<String>) -> Vec<Module> {
+    // Module key -> module. Object modules are keyed by their file.
     let mut modules: BTreeMap<String, Module> = BTreeMap::new();
-    let plugin_global = &gb.plugin_global;
+    let plugin_tables = plugin_tables(gb);
 
     // Class declarations first, so modules get their docs and kind.
     for (path, scan) in &gb.files {
@@ -327,38 +776,35 @@ fn build_modules(gb: &GroupBuilder, group_title: &str, documented_only: bool) ->
         }
     }
 
+    // (file, qualified name as written) -> (module key, sep, name), to name
+    // the callers of hooks.
+    let mut declared: HashMap<(&str, String), (String, Sep, String)> = HashMap::new();
+    // Module keys each file's functions land in, its object modules and its
+    // hook handler module.
+    let mut file_modules: HashMap<&str, Vec<String>> = HashMap::new();
+    let mut file_objects: HashMap<&str, Vec<String>> = HashMap::new();
+    let mut file_handler: HashMap<&str, String> = HashMap::new();
+
     for (path, scan) in &gb.files {
-        // Categories declared in this file, by name.
         let file_categories: HashMap<&str, &Category> = scan.categories.iter().map(|c| (c.name.as_str(), c)).collect();
+        let objects = local_objects(path, &rel_path(gb, path), scan, documented_only);
+        file_objects.insert(path, objects.iter().flatten().map(|t| t.key.clone()).collect());
 
         for f in &scan.functions {
             if documented_only && f.doc.is_none() {
                 continue;
             }
-            let raw_owner = f.owner.clone();
-            let owner = resolve_owner(&raw_owner, scan, plugin_global);
-            let first = owner.split('.').next().unwrap_or("").to_string();
-
-            let (key, id, title, subtitle, kind) = if owner.is_empty() {
-                ("globals".to_string(), "Globals".to_string(), "Globals".to_string(), Some(format!("Global functions of {group_title}")), ModuleKind::Globals)
-            } else if PER_FILE_OBJECTS.contains(&first.as_str()) {
-                let name = if first == "PANEL" { scan.vgui_name.clone().unwrap_or_else(|| file_stem(path)) } else { file_stem(path) };
-                (format!("{}\u{0}{}", first, path), name.clone(), name, Some(first.clone()), ModuleKind::Object { object: first.clone() })
-            } else if owner == "GM" {
-                (owner.to_ascii_lowercase(), owner.clone(), owner.clone(), Some("Gamemode hooks".to_string()), ModuleKind::Hooks)
-            } else if raw_owner == "PLUGIN" || plugin_global.as_deref() == Some(owner.as_str()) {
-                let id = if owner == "PLUGIN" { gb.name.clone().unwrap_or_else(|| gb.key.clone()) } else { owner.clone() };
-                (owner.to_ascii_lowercase(), id.clone(), id, Some("Plugin hooks and methods".to_string()), ModuleKind::Hooks)
-            } else {
-                (owner.to_ascii_lowercase(), owner.clone(), owner.clone(), None, ModuleKind::Library)
+            let owner = resolve_owner(&f.owner, scan, &gb.plugin_global);
+            let target = match f.local_table.and_then(|i| objects[i].clone()) {
+                Some(t) => t,
+                None => owner_target(gb, group_title, path, scan, f, &owner, &plugin_tables),
             };
-
-            let m = modules.entry(key).or_insert_with(|| {
-                let mut m = new_module(&id, kind.clone());
+            let key = target.key.clone();
+            let title = target.title.clone();
+            let m = modules.entry(key.clone()).or_insert_with(|| target.into_module());
+            if m.title == m.id && title != m.id {
                 m.title = title;
-                m.subtitle = subtitle;
-                m
-            });
+            }
             if !m.files.contains(path) {
                 m.files.push(path.clone());
             }
@@ -367,51 +813,247 @@ fn build_modules(gb: &GroupBuilder, group_title: &str, documented_only: bool) ->
             }
 
             let category = f.category.clone().unwrap_or_else(|| match (&m.kind, f.sep) {
-                (ModuleKind::Hooks, _) if owner == "GM" => "Hooks".to_string(),
+                (ModuleKind::Handlers { .. }, _) if is_hook_name(&f.name) => "Hooks".to_string(),
                 (_, Sep::Colon) => "Methods".to_string(),
                 _ => "Functions".to_string(),
             });
-            if !m.categories.iter().any(|c| c.name == category) {
-                let description = file_categories.get(category.as_str()).map(|c| c.description.clone()).unwrap_or_default();
-                m.categories.push(Category { name: category.clone(), description });
-            }
+            ensure_category(m, &category, &file_categories);
 
-            m.functions.push(Function { name: f.name.clone(), owner: owner.clone(), sep: f.sep, params: f.params.clone(), doc: f.doc.clone(), file: path.clone(), line: f.line, anchor: String::new(), category });
+            let realm = definition_realm(f.doc.as_ref(), f.realm, path);
+            add_function(
+                m,
+                Function {
+                    name: f.name.clone(),
+                    owner: owner.clone(),
+                    sep: f.sep,
+                    params: f.params.clone(),
+                    doc: f.doc.clone(),
+                    file: path.clone(),
+                    line: f.line,
+                    anchor: String::new(),
+                    category,
+                    kind: FunctionKind::Declared,
+                    realm,
+                    sources: vec![(path.clone(), f.line, realm)],
+                    client_doc: None,
+                    callers: Vec::new(),
+                    hook_id: None,
+                    implements: None,
+                },
+            );
+            if matches!(m.kind, ModuleKind::Handlers { .. }) {
+                file_handler.entry(path).or_insert_with(|| key.clone());
+            }
+            declared.insert((path, f.qualified()), (key.clone(), f.sep, f.name.clone()));
+            let keys = file_modules.entry(path).or_default();
+            if !keys.contains(&key) {
+                keys.push(key);
+            }
+        }
+    }
+
+    // `hook.Add` handlers go to the file's plugin or gamemode table, else
+    // to a `hook.Add` module.
+    for (path, scan) in &gb.files {
+        for add in &scan.hook_adds {
+            if documented_only && add.doc.is_none() {
+                continue;
+            }
+            let target = if file_has_plugin(scan) { handler_target(gb.plugin_global.as_deref().unwrap_or("PLUGIN"), "PLUGIN", group_title) } else { handler_target("hook.Add", "hook.Add", group_title) };
+            let key = file_handler.get(path.as_str()).cloned().unwrap_or_else(|| target.key.clone());
+            let m = modules.entry(key).or_insert_with(|| target.into_module());
+            if !m.files.contains(path) {
+                m.files.push(path.clone());
+            }
+            ensure_category(m, "Hooks", &HashMap::new());
+            let realm = definition_realm(add.doc.as_ref(), add.realm, path);
+            m.functions.push(Function {
+                name: add.name.clone(),
+                owner: String::new(),
+                sep: Sep::None,
+                params: add.params.clone(),
+                doc: add.doc.clone(),
+                file: path.clone(),
+                line: add.line,
+                anchor: String::new(),
+                category: "Hooks".to_string(),
+                kind: FunctionKind::HookAdd,
+                realm,
+                sources: vec![(path.clone(), add.line, realm)],
+                client_doc: None,
+                callers: Vec::new(),
+                hook_id: add.id.clone(),
+                implements: None,
+            });
+        }
+    }
+
+    // The hooks the group runs, one function per name. Callers are kept as
+    // `file\0caller` until the module ids are final.
+    let mut hook_sites: Vec<(String, Vec<(&str, &crate::scanner::HookCall)>)> = Vec::new();
+    for (path, scan) in &gb.files {
+        for call in &scan.hook_calls {
+            match hook_sites.iter_mut().find(|(name, _)| *name == call.name) {
+                Some((_, sites)) => sites.push((path, call)),
+                None => hook_sites.push((call.name.clone(), vec![(path, call)])),
+            }
+        }
+    }
+    let mut hooks = new_module("Hooks", ModuleKind::Hooks);
+    hooks.subtitle = Some(format!("Hooks called by {group_title}"));
+    hooks.categories.push(Category { name: "Hooks".to_string(), description: String::new() });
+    for (name, sites) in hook_sites {
+        let documented = sites.iter().find(|(_, c)| c.doc.is_some());
+        if documented_only && documented.is_none() {
+            continue;
+        }
+        let sources: Vec<(String, usize, Realm)> = sites.iter().map(|(p, c)| (p.to_string(), c.line, definition_realm(c.doc.as_ref(), c.realm, p))).collect();
+        let realm = if sources.iter().all(|s| s.2 == sources[0].2) { sources[0].2 } else { Realm::Shared };
+        let widest = sites.iter().fold(sites[0].1, |best, (_, c)| if c.args.len() > best.args.len() { *c } else { best });
+        let (file, primary) = documented.copied().unwrap_or(sites[0]);
+        for (p, _) in &sites {
+            if !hooks.files.iter().any(|f| f == p) {
+                hooks.files.push(p.to_string());
+            }
+        }
+        hooks.functions.push(Function {
+            name,
+            owner: String::new(),
+            sep: Sep::None,
+            params: widest.args.clone(),
+            doc: primary.doc.clone(),
+            file: file.to_string(),
+            line: primary.line,
+            anchor: String::new(),
+            category: "Hooks".to_string(),
+            kind: FunctionKind::Hook,
+            realm,
+            sources,
+            client_doc: None,
+            callers: sites.iter().filter_map(|(p, c)| c.caller.as_ref().map(|caller| format!("{p}\u{0}{caller}"))).collect(),
+            hook_id: None,
+            implements: None,
+        });
+    }
+    if !hooks.functions.is_empty() {
+        modules.insert(HOOKS_KEY.to_string(), hooks);
+    }
+
+    // File docs document the module their `@module` names, else the
+    // module of their library, else their only object or module. Files
+    // named `sh_` win, then the first file.
+    let mut file_docs: HashMap<String, ((bool, usize), &DocBlock)> = HashMap::new();
+    for (order, (path, scan)) in gb.files.iter().enumerate() {
+        let Some(doc) = scan.file_doc.as_ref().filter(|d| !is_banner(d)) else { continue };
+        let by_id = |id: &str| modules.iter().find(|(_, m)| m.id.eq_ignore_ascii_case(id) && m.kind != ModuleKind::Hooks).map(|(k, _)| k.clone());
+        let objects = file_objects.get(path.as_str()).map(Vec::as_slice).unwrap_or_default();
+        let single_object = (objects.len() == 1 && scan.libraries.is_empty()).then(|| objects[0].clone());
+        let target = match &doc.module {
+            Some(name) => single_object.filter(|k| modules.get(k).is_some_and(|m| m.id == *name)).or_else(|| by_id(name)),
+            None => scan
+                .libraries
+                .first()
+                .and_then(|(library, _)| by_id(library))
+                .or(single_object)
+                .or_else(|| file_modules.get(path.as_str()).filter(|keys| keys.len() == 1).map(|keys| keys[0].clone())),
+        };
+        if let Some(key) = target {
+            let rank = (!file_stem(path).starts_with("sh_"), order);
+            if file_docs.get(&key).is_none_or(|(r, _)| rank < *r) {
+                file_docs.insert(key, (rank, doc));
+            }
+        }
+    }
+    for (key, (_, doc)) in file_docs {
+        if let Some(m) = modules.get_mut(&key)
+            && m.doc.is_none()
+        {
+            m.doc = Some(doc.clone());
         }
     }
 
     // Keep declared classes that have no functions only when documented.
     modules.retain(|_, m| !m.functions.is_empty() || m.doc.is_some());
 
-    let mut out: Vec<Module> = modules.into_values().collect();
-
-    // Per-file objects may share a title inside a group; make ids unique.
-    let mut seen: HashMap<String, usize> = HashMap::new();
-    for m in &mut out {
-        let n = seen.entry(m.id.to_ascii_lowercase()).or_insert(0);
-        *n += 1;
-        if *n > 1 {
-            let suffix = match &m.kind {
-                ModuleKind::Object { object } => object.clone(),
-                _ => n.to_string(),
-            };
-            m.id = format!("{}.{}", m.id, suffix);
-            m.title = m.id.clone();
+    for m in modules.values_mut() {
+        for f in &mut m.functions {
+            if f.category == "Hooks" && f.kind != FunctionKind::Hook && called.contains(&f.name) {
+                f.implements = Some(format!("hook:{}", f.name));
+            }
         }
-        m.slug = slugify(&m.id);
+    }
+
+    // Ids must be unique in the group. Named modules and the hooks page
+    // keep their id before objects do; a colliding module is told apart by
+    // its file name or directory, a counter only as the last resort.
+    let mut out: Vec<(String, Module)> = modules.into_iter().collect();
+    out.sort_by_key(|(key, _)| key.starts_with('\u{2}'));
+    // Taken id (lower case) -> file of the object module holding it; a
+    // disambiguator must differ from that file's.
+    let mut taken: HashMap<String, String> = HashMap::new();
+    for (_, m) in &mut out {
+        let file = m.files.first().cloned().unwrap_or_default();
+        let holder = match taken.get(&m.id.to_ascii_lowercase()) {
+            None => {
+                let own = if matches!(m.kind, ModuleKind::Object { .. }) { file } else { String::new() };
+                taken.insert(m.id.to_ascii_lowercase(), own);
+                continue;
+            }
+            Some(holder) => holder.clone(),
+        };
+        let parent = |p: &str| parent_dir(p).unwrap_or("").to_string();
+        let candidates = [(bare_stem(&file), bare_stem(&holder)), (parent(&file), parent(&holder)), (file_stem(&file), file_stem(&holder))];
+        let readable = candidates
+            .into_iter()
+            .filter(|(d, theirs)| !d.is_empty() && d != theirs && !d.eq_ignore_ascii_case(&m.id))
+            .map(|(d, _)| d)
+            .find(|d| !taken.contains_key(&format!("{}-{d}", m.id).to_ascii_lowercase()));
+        let suffix = readable.unwrap_or_else(|| {
+            let mut n = 2;
+            while taken.contains_key(&format!("{}-{n}", m.id).to_ascii_lowercase()) {
+                n += 1;
+            }
+            n.to_string()
+        });
+        taken.insert(format!("{}-{suffix}", m.id).to_ascii_lowercase(), file);
+        m.title = format!("{} ({suffix})", m.title);
+        m.id = format!("{}-{suffix}", m.id);
     }
     // Slugs must be unique on case-insensitive file systems.
     let mut slugs: HashSet<String> = HashSet::new();
-    for m in &mut out {
-        let mut slug = m.slug.clone();
+    for (_, m) in &mut out {
+        let base = slugify(&m.id);
+        let mut slug = base.clone();
         let mut n = 1;
         while !slugs.insert(slug.to_ascii_lowercase()) {
             n += 1;
-            slug = format!("{}-{n}", m.slug);
+            slug = format!("{base}-{n}");
         }
         m.slug = slug;
     }
 
+    // Hook callers, named after the modules their functions landed in.
+    let ids: HashMap<String, (String, bool)> = out.iter().map(|(k, m)| (k.clone(), (m.id.clone(), m.kind == ModuleKind::Globals))).collect();
+    for (_, m) in &mut out {
+        for f in m.functions.iter_mut().filter(|f| f.kind == FunctionKind::Hook) {
+            let mut callers: Vec<String> = Vec::new();
+            for raw in std::mem::take(&mut f.callers) {
+                let (path, caller) = raw.split_once('\u{0}').unwrap_or(("", raw.as_str()));
+                let named = match declared.get(&(path, caller.to_string())).and_then(|(key, sep, name)| ids.get(key).map(|(id, globals)| (id, *globals, *sep, name))) {
+                    Some((_, true, _, name)) | Some((_, _, Sep::None, name)) => name.clone(),
+                    Some((id, _, Sep::Dot, name)) => format!("{id}.{name}"),
+                    Some((id, _, Sep::Colon, name)) => format!("{id}:{name}"),
+                    None => caller.to_string(),
+                };
+                if !callers.contains(&named) {
+                    callers.push(named);
+                }
+            }
+            f.callers = callers;
+        }
+    }
+
+    let mut out: Vec<Module> = out.into_iter().map(|(_, m)| m).collect();
     for m in &mut out {
         // Default categories first, then custom ones in order of appearance.
         m.categories.sort_by_key(|c| match c.name.as_str() {
@@ -434,14 +1076,7 @@ fn build_modules(gb: &GroupBuilder, group_title: &str, documented_only: bool) ->
         }
     }
 
-    out.sort_by(|a, b| {
-        let rank = |m: &Module| match m.kind {
-            ModuleKind::Hooks => 0,
-            ModuleKind::Globals => 1,
-            _ => 2,
-        };
-        rank(a).cmp(&rank(b)).then(a.id.to_ascii_lowercase().cmp(&b.id.to_ascii_lowercase()))
-    });
+    out.sort_by(|a, b| module_rank(&a.kind).cmp(&module_rank(&b.kind)).then(a.id.to_ascii_lowercase().cmp(&b.id.to_ascii_lowercase())));
     out
 }
 
@@ -463,8 +1098,27 @@ fn build_index(project: &Project) -> HashMap<String, String> {
                 if let ModuleKind::Object { object } = &m.kind {
                     insert(format!("{object}:{}", m.id), &page);
                 }
-                for f in &m.functions {
+                // Declared functions take their names before hook handlers.
+                let mut functions: Vec<&Function> = m.functions.iter().collect();
+                functions.sort_by_key(|f| f.kind != FunctionKind::Declared);
+                for f in functions {
                     let url = format!("{page}#{}", f.anchor);
+                    match f.kind {
+                        FunctionKind::Hook => {
+                            insert(format!("hook:{}", f.name), &url);
+                            for owner in ["Hooks", m.id.as_str()] {
+                                for sep in ['#', ':', '.'] {
+                                    insert(format!("{owner}{sep}{}", f.name), &url);
+                                }
+                            }
+                            continue;
+                        }
+                        FunctionKind::HookAdd => {
+                            insert(format!("{}#{}", m.id, f.name), &url);
+                            continue;
+                        }
+                        FunctionKind::Declared => {}
+                    }
                     if f.owner.is_empty() {
                         insert(f.name.clone(), &url);
                         continue;
@@ -496,8 +1150,8 @@ fn build_index(project: &Project) -> HashMap<String, String> {
 }
 
 impl Project {
-    /// Resolves a reference such as `Owner#name`, `Owner.name`, `name` or
-    /// `Owner` to a URL relative to the docs root.
+    /// Resolves a reference such as `Owner#name`, `Owner.name`, `name`,
+    /// `Owner` or `hook:Name` to a URL relative to the docs root.
     pub fn resolve(&self, reference: &str) -> Option<String> {
         let r = reference.trim().trim_end_matches("()");
         if r.is_empty() || r.contains(char::is_whitespace) {
@@ -573,7 +1227,9 @@ mod tests {
         assert_eq!(chars.functions.len(), 2, "PLUGIN and the global merge");
         let crosshair = &plugins.groups[1];
         assert_eq!(crosshair.title, "Crosshair");
-        assert_eq!(crosshair.modules[0].id, "Crosshair");
+        assert_eq!(crosshair.modules[0].id, "PLUGIN", "plugin tables keep their name, the group has the title");
+        assert_eq!(crosshair.modules[0].kind, ModuleKind::Handlers { object: "PLUGIN".to_string() });
+        assert_eq!(crosshair.modules[0].functions[0].category, "Hooks");
         assert_eq!(crosshair.dir, "plugins/sh_crosshair");
     }
 
@@ -609,7 +1265,7 @@ mod tests {
         assert_eq!(plugins, vec![("sh_raisegun", "plugins/sh_raisegun"), ("Stamina", "plugins/stamina")]);
         let stamina = &p.sections[1].groups[1];
         assert_eq!((stamina.description.as_deref(), stamina.author.as_deref(), stamina.version.as_deref()), (Some("From code."), Some("kurozael"), Some("0.93")));
-        assert_eq!(stamina.modules[0].id, "Stamina");
+        assert_eq!(stamina.modules[0].id, "PLUGIN");
         assert_eq!(p.resolve("Kernel.Init").as_deref(), Some("catwork/Kernel.html#Init"));
         assert_eq!(p.resolve("x"), None, "files outside every group are skipped");
     }
@@ -626,5 +1282,237 @@ mod tests {
         assert_eq!(p.resolve("player_meta#jump").as_deref(), Some("flux/Player.html#jump"));
         assert_eq!(p.resolve("Player:jump()").as_deref(), Some("flux/Player.html#jump"));
         assert_eq!(p.resolve("nothing"), None);
+    }
+
+    fn core(files: Vec<(&str, &str)>) -> Vec<Module> {
+        let layout = Layout::default_for("Flux");
+        let meta = HashMap::new();
+        let files = files.into_iter().map(|(p, src)| (p.to_string(), scan(src))).collect();
+        let p = build(files, BuildOptions { title: Some("Flux"), ..BuildOptions::new(&layout, &meta) });
+        p.sections.into_iter().next().map(|s| s.groups.into_iter().next().unwrap().modules).unwrap_or_default()
+    }
+
+    fn module<'a>(modules: &'a [Module], id: &str) -> &'a Module {
+        modules.iter().find(|m| m.id == id).unwrap_or_else(|| panic!("no module {id} in {:?}", modules.iter().map(|m| &m.id).collect::<Vec<_>>()))
+    }
+
+    #[test]
+    fn assigns_realms_to_functions() {
+        let modules = core(vec![
+            ("lib/sv_a.lua", "function A.server() end\n--- Doc.\n-- @realm client\nfunction A.tagged() end"),
+            ("lib/sh_b.lua", "function A.shared() end\nif CLIENT then\n  function A.client() end\nend"),
+            ("lib/server/c.lua", "function A.dir() end"),
+        ]);
+        let realms: Vec<(&str, Realm)> = module(&modules, "A").functions.iter().map(|f| (f.name.as_str(), f.realm)).collect();
+        assert_eq!(realms, vec![("client", Realm::Client), ("dir", Realm::Server), ("server", Realm::Server), ("shared", Realm::Shared), ("tagged", Realm::Client)]);
+        let f = &module(&modules, "A").functions[0];
+        assert_eq!(f.sources, vec![("lib/sh_b.lua".to_string(), 3, Realm::Client)]);
+        assert_eq!(f.kind, FunctionKind::Declared);
+    }
+
+    #[test]
+    fn merges_realm_twins() {
+        let modules = core(vec![
+            ("core/cl_kernel.lua", "local playerMeta = FindMetaTable('Player')\n--- Client data.\nfunction playerMeta:GetData(key) end\n--- Same.\nfunction cw.core:Same() end\nfunction cw.core:Undocumented() end\n--- Inc.\n-- @realm client\nfunction cw.core:IncludeSchema() end"),
+            ("core/sv_kernel.lua", "local playerMeta = FindMetaTable('Player')\n--- Server data.\nfunction playerMeta:GetData(key, default) end\n--- Same.\nfunction cw.core:Same() end\n--- Documented.\nfunction cw.core:Undocumented() end\n--- Inc.\n-- @realm server\nfunction cw.core:IncludeSchema() end\nfunction cw.core:Twice() end\nfunction cw.core:Twice() end"),
+            ("entities/entities/cw_item/shared.lua", "ENT.PrintName = 'Item'\n--- Shared.\nfunction ENT:GetItemTable() end\nfunction ENT:SetupDataTables() end"),
+            ("entities/entities/cw_item/init.lua", "--- Server override.\nfunction ENT:GetItemTable() end\nfunction ENT:Think() end"),
+            ("entities/entities/cw_item/cl_init.lua", "function ENT:Think() end\nfunction ENT:Draw() end"),
+        ]);
+        let get = |m: &str, name: &str| -> Vec<Function> { module(&modules, m).functions.iter().filter(|f| f.name == name).cloned().collect() };
+
+        let data = get("Player", "GetData");
+        assert_eq!(data.len(), 1);
+        let data = &data[0];
+        assert_eq!(data.realm, Realm::Shared);
+        assert_eq!((data.file.as_str(), data.line), ("core/sv_kernel.lua", 3), "the server definition is primary");
+        assert_eq!(data.params, vec!["key", "default"]);
+        assert_eq!(data.summary(), "Server data.");
+        assert_eq!(data.client_doc.as_ref().unwrap().summary(), "Client data.");
+        assert_eq!(data.sources, vec![("core/sv_kernel.lua".to_string(), 3, Realm::Server), ("core/cl_kernel.lua".to_string(), 3, Realm::Client)]);
+
+        assert!(get("cw.core", "Same")[0].client_doc.is_none(), "identical docs are kept once");
+        assert!(get("cw.core", "IncludeSchema")[0].client_doc.is_none(), "docs differing only in @realm are identical");
+        assert_eq!(get("cw.core", "IncludeSchema").len(), 1);
+        let undocumented = &get("cw.core", "Undocumented")[0];
+        assert_eq!(undocumented.summary(), "Documented.");
+        assert!(undocumented.client_doc.is_none());
+        let twice = get("cw.core", "Twice");
+        assert_eq!(twice.len(), 2, "definitions in the same realm are not twins");
+        let anchors: Vec<&str> = twice.iter().map(|f| f.anchor.as_str()).collect();
+        assert_eq!(anchors, vec!["Twice", "Twice-2"]);
+
+        let item = module(&modules, "cw_item");
+        assert_eq!((item.title.as_str(), item.subtitle.as_deref()), ("Item", Some("Entity")));
+        assert_eq!(item.files.len(), 3);
+        let table = &get("cw_item", "GetItemTable")[0];
+        assert_eq!((table.realm, table.file.as_str(), table.summary().as_str()), (Realm::Shared, "entities/entities/cw_item/shared.lua", "Shared."));
+        assert_eq!(table.sources.len(), 2);
+        let think = &get("cw_item", "Think")[0];
+        assert_eq!((think.realm, think.file.as_str(), think.sources.len()), (Realm::Shared, "entities/entities/cw_item/init.lua", 2));
+        assert_eq!(get("cw_item", "Draw")[0].realm, Realm::Client);
+    }
+
+    #[test]
+    fn builds_objects_from_local_tables() {
+        let panels: String = (1..=3).map(|i| format!("local PANEL = {{}}\nfunction PANEL:Init() end\nvgui.Register('cw.panel{i}', PANEL, 'DPanel')\n")).collect();
+        let modules = core(vec![
+            ("core/libraries/sh_currency.lua", "--- The currency library.\nlibrary.New('currency', cw)\nlocal stored = cw.currency.stored or {}\nlocal CLASS_TABLE = { __index = CLASS_TABLE }\nfunction CLASS_TABLE:Query() end\nfunction stored.thing() end\nfunction cw.currency:Get() end"),
+            ("core/libraries/sh_bars.lua", "library.New('bars', cw)\n--- A bar.\nlocal CLASS_TABLE = { __index = CLASS_TABLE }\nfunction CLASS_TABLE:Draw() end"),
+            ("core/libraries/sh_loose.lua", "--- Loose objects.\nlocal CLASS_TABLE = {}\nfunction CLASS_TABLE:Draw() end"),
+            ("core/derma/cl_character.lua", &panels),
+            ("core/commands/sh_a.lua", "local COMMAND = cw.command:New('A')\nfunction COMMAND:OnRun() end"),
+            ("core/blueprints/sh_chair.lua", "local BLUEPRINT = cw.blueprints:New()\nBLUEPRINT.name = 'Chair'\nfunction BLUEPRINT:OnBuild() end"),
+            ("core/named.lua", "--- @module [Named]\nlocal T = setmetatable({}, mt)\nfunction T:x() end"),
+            ("lib/sv_hooks.lua", "local PLUGIN = PLUGIN\nfunction PLUGIN:PlayerSpawn() end"),
+            ("lib/cable.lua", "local cable = {}\nfunction cable.connect() end"),
+            ("lib/sh_binds.lua", "local hooks = {}\nfunction hooks.Think() hook.Run('BindPressed') end"),
+            ("core/alias.lua", "local util = util\nfunction util.thing() end\nlocal n = 1\nlocal mat = Material('x')\nfunction mat.y() end"),
+        ]);
+        let class = module(&modules, "cw.currency.Class");
+        assert_eq!(class.kind, ModuleKind::Object { object: "CLASS_TABLE".to_string() });
+        assert_eq!(class.subtitle.as_deref(), Some("Object table CLASS_TABLE in core/libraries/sh_currency.lua"));
+        assert_eq!(class.decl_file, Some(("core/libraries/sh_currency.lua".to_string(), 4)));
+        assert!(class.doc.is_none(), "the file doc belongs to the library");
+        assert_eq!(module(&modules, "cw.currency").summary(), "The currency library.");
+        assert_eq!(module(&modules, "stored").functions[0].name, "thing", "`x or {{}}` is not an object");
+        assert_eq!(module(&modules, "cw.bars.Class").summary(), "A bar.");
+        assert_eq!(module(&modules, "loose.Class").summary(), "Loose objects.", "the only object of a file without a library gets the file doc");
+        for i in 1..=3 {
+            assert_eq!(module(&modules, &format!("cw.panel{i}")).kind, ModuleKind::Object { object: "PANEL".to_string() });
+        }
+        assert_eq!(module(&modules, "A").functions[0].name, "OnRun");
+        let chair = module(&modules, "chair.Blueprint");
+        assert_eq!(chair.title, "Chair");
+        assert_eq!(module(&modules, "Named").functions[0].name, "x");
+        assert_eq!(module(&modules, "util").kind, ModuleKind::Library, "an alias is not an object");
+        assert_eq!(module(&modules, "mat").kind, ModuleKind::Library, "a plain call is not an object");
+        assert_eq!(module(&modules, "cable").kind, ModuleKind::Object { object: "cable".to_string() }, "other locals keep their name");
+        assert_eq!(module(&modules, "hooks-binds").title, "hooks (binds)", "the hooks page keeps its id");
+        assert_eq!(module(&modules, "Hooks").kind, ModuleKind::Hooks);
+        assert_eq!(module(&modules, "PLUGIN").kind, ModuleKind::Handlers { object: "PLUGIN".to_string() });
+    }
+
+    #[test]
+    fn recognises_object_initialisers() {
+        for yes in ["{}", "{ __index = CLASS_TABLE }", "cw.command:New('A')", "item.New('x', true)", "setmetatable({}, mt)", "cw.theme:Begin()", "cw.x:New('aaaa…"] {
+            assert!(is_object_init(yes), "{yes}");
+        }
+        for no in ["PLUGIN", "cw.currency.stored or {}", "1", "'str'", "Material('x')", "cw.x:New() or {}", "a.b", "item.get('x')", "x:new 'a'"] {
+            assert!(!is_object_init(no), "{no}");
+        }
+        assert_eq!(constructor_name("cw.command:New('CharFallOver')").as_deref(), Some("CharFallOver"));
+        assert_eq!(constructor_name("cw.system:New('Manage \\'Players\\'')").as_deref(), Some("Manage 'Players'"));
+        assert_eq!(constructor_name("cw.attribute:New()"), None);
+        assert_eq!(constructor_name("faction.New('#Faction_Admin')"), None, "language keys are not names");
+        assert_eq!(object_word("CLASS_TABLE"), "Class");
+        assert_eq!(object_word("PANEL"), "Panel");
+        assert_eq!(object_word("ITEM_META"), "ItemMeta");
+        assert_eq!(object_word("stored"), "Stored");
+    }
+
+    #[test]
+    fn names_per_file_objects_and_entity_folders() {
+        let modules = core(vec![
+            ("entities/weapons/cw_hands/shared.lua", "SWEP.PrintName = 'Hands'\nfunction SWEP:PrimaryAttack() end"),
+            ("entities/weapons/cw_baton/shared.lua", "SWEP.PrintName = 'Stun\\n  baton'\nfunction SWEP:PrimaryAttack() end"),
+            ("entities/effects/blood/init.lua", "function EFFECT:Init() end"),
+            ("items/a/sh_box.lua", "ITEM.name = 'Box'\nITEM.PrintName = '#Item_Box'\nfunction ITEM:OnUse() end"),
+            ("items/b/sh_box.lua", "function ITEM:OnUse() end"),
+            ("items/c/box.lua", "function ITEM:OnUse() end"),
+        ]);
+        let hands = module(&modules, "cw_hands");
+        assert_eq!((hands.title.as_str(), hands.subtitle.as_deref()), ("Hands", Some("Weapon")));
+        assert_eq!(module(&modules, "blood").subtitle.as_deref(), Some("Effect"));
+        assert_eq!(module(&modules, "cw_baton").title, "Stun baton");
+        let boxes: Vec<(&str, &str)> = modules.iter().filter(|m| m.id.contains("box")).map(|m| (m.id.as_str(), m.title.as_str())).collect();
+        assert_eq!(boxes, vec![("box", "box"), ("sh_box", "Box"), ("sh_box-b", "sh_box (b)")]);
+        assert_eq!(module(&modules, "sh_box").subtitle.as_deref(), Some("Object ITEM in items/a/sh_box.lua"));
+    }
+
+    #[test]
+    fn builds_hook_pages() {
+        let layout = Layout::default_for("Flux");
+        let meta = HashMap::new();
+        let files = vec![
+            ("lib/sv_player.lua".to_string(), scan("local playerMeta = FindMetaTable('Player')\nfunction playerMeta:SetModel(m)\n  hook.Run('PlayerModelChanged', self, m)\nend")),
+            ("lib/cl_player.lua".to_string(), scan("local playerMeta = FindMetaTable('Player')\nfunction playerMeta:SetModel(m)\n  --- Called when a model changes.\n  -- @param player [Player]\n  hook.Run('PlayerModelChanged', self, m, old)\nend\nlocal function helper()\n  hook.Run('PlayerModelChanged', x)\nend\nfunction cw.core:Init()\n  hook.Run('PlayerModelChanged')\n  if SERVER then hook.Run('ServerOnly') end\nend\nfunction GM:Initialize() end\nfunction GM:helper() end")),
+            ("plugins/stamina/sh_plugin.lua".to_string(), scan("PLUGIN:SetGlobalAlias('cwStamina')\nfunction cwStamina:PlayerModelChanged(player) end\nfunction cwStamina:get_stamina() end\nfunction PLUGIN:Think() end\n--- Adds.\nhook.Add('ServerOnly', 'cwStamina.x', function(a, b) end)")),
+            ("plugins/stamina/cl_hooks.lua".to_string(), scan("hook.Add('Think', 'x', function() end)")),
+        ];
+        let p = build(files, BuildOptions { title: Some("Flux"), ..BuildOptions::new(&layout, &meta) });
+        let modules = &p.sections[0].groups[0].modules;
+        let ids: Vec<&str> = modules.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, vec!["Hooks", "GM", "cw.core", "Player"]);
+        let hooks = &modules[0];
+        assert_eq!((hooks.kind.clone(), hooks.subtitle.as_deref()), (ModuleKind::Hooks, Some("Hooks called by Flux")));
+        let changed = &hooks.functions[0];
+        assert_eq!(changed.name, "PlayerModelChanged");
+        assert_eq!(changed.kind, FunctionKind::Hook);
+        assert_eq!(changed.params, vec!["self", "m", "old"]);
+        assert_eq!(changed.realm, Realm::Shared);
+        assert_eq!(changed.summary(), "Called when a model changes.");
+        assert_eq!((changed.file.as_str(), changed.line), ("lib/cl_player.lua", 5));
+        assert_eq!(changed.sources.len(), 4);
+        assert_eq!(changed.callers, vec!["Player:SetModel", "helper", "cw.core:Init"]);
+        let server_only = &hooks.functions[1];
+        assert_eq!((server_only.name.as_str(), server_only.realm), ("ServerOnly", Realm::Server));
+        assert!(server_only.params.is_empty());
+
+        let gm = &modules[1];
+        assert_eq!(gm.kind, ModuleKind::Handlers { object: "GM".to_string() });
+        assert_eq!(gm.kind.badge(), "gamemode");
+        let categories: Vec<(&str, &str)> = gm.functions.iter().map(|f| (f.name.as_str(), f.category.as_str())).collect();
+        assert_eq!(categories, vec![("helper", "Methods"), ("Initialize", "Hooks")]);
+
+        let stamina = &p.sections[1].groups[0].modules;
+        let ids: Vec<&str> = stamina.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, vec!["cwStamina", "hook.Add"]);
+        let plugin = &stamina[0];
+        assert_eq!(plugin.kind.badge(), "plugin");
+        let fns: Vec<(&str, &str, Option<&str>)> = plugin.functions.iter().map(|f| (f.name.as_str(), f.category.as_str(), f.implements.as_deref())).collect();
+        assert_eq!(fns, vec![("get_stamina", "Methods", None), ("PlayerModelChanged", "Hooks", Some("hook:PlayerModelChanged")), ("ServerOnly", "Hooks", Some("hook:ServerOnly")), ("Think", "Hooks", None)]);
+        let added = plugin.functions.iter().find(|f| f.kind == FunctionKind::HookAdd).unwrap();
+        assert_eq!((added.hook_id.as_deref(), added.params.clone(), added.summary()), (Some("cwStamina.x"), vec!["a".to_string(), "b".to_string()], "Adds.".to_string()));
+        let hook_add = &stamina[1];
+        assert_eq!((hook_add.title.as_str(), hook_add.kind.badge(), hook_add.functions[0].realm), ("hook.Add", "handlers", Realm::Client));
+
+        for key in ["hook:PlayerModelChanged", "Hooks#PlayerModelChanged", "Hooks:PlayerModelChanged", "Hooks.PlayerModelChanged"] {
+            assert_eq!(p.resolve(key).as_deref(), Some("flux/Hooks.html#PlayerModelChanged"), "{key}");
+        }
+        assert_eq!(p.resolve("PlayerModelChanged"), None, "hook names are not global functions");
+        assert_eq!(p.resolve("cwStamina:PlayerModelChanged").as_deref(), Some("plugins/stamina/cwStamina.html#PlayerModelChanged"));
+        assert_eq!(p.resolve("hook.Add#Think").as_deref(), Some("plugins/stamina/hook.Add.html#Think"));
+    }
+
+    #[test]
+    fn attaches_file_docs() {
+        let modules = core(vec![
+            ("lib/cl_a.lua", "--- From the client file.\n\nfunction A.x() end"),
+            ("lib/sh_a.lua", "--- From the shared file.\n\nfunction A.y() end"),
+            ("lib/sv_a.lua", "--- From the server file.\n\nfunction A.z() end"),
+            ("lib/b.lua", "--- Names B.\n-- @module [B]\n\nfunction A.w() end\nfunction B.x() end"),
+            ("lib/c.lua", "--- Spans two modules.\n\nfunction C.x() end\nfunction D.x() end"),
+            ("lib/sh_stdlib.lua", "--- +-+-+-+\n-- More text.\n\nfunction E.x() end"),
+            ("lib/f.lua", "--- The Flux bars.\nmod 'Flux::Bars'\nfunction Flux.Bars:x() end\nfunction G.x() end"),
+        ]);
+        assert_eq!(module(&modules, "A").summary(), "From the shared file.");
+        assert_eq!(module(&modules, "B").summary(), "Names B.");
+        assert!(module(&modules, "C").doc.is_none() && module(&modules, "D").doc.is_none());
+        assert!(module(&modules, "E").doc.is_none(), "banners are not docs");
+        assert_eq!(module(&modules, "Flux.Bars").summary(), "The Flux bars.");
+    }
+
+    #[test]
+    fn reads_plugin_fields() {
+        let layout = Layout::default_for("Flux");
+        let meta = HashMap::new();
+        let files = vec![("plugins/cl_crosshair.lua".to_string(), scan("local PLUGIN = PLUGIN\nPLUGIN.name = 'Crosshair'\nPLUGIN.author = 'Mr. Meow'\nPLUGIN.description = 'Adds a crosshair.'\nfunction PLUGIN:HUDPaint() end\nhook.Add('Think', 'x', function() end)"))];
+        let p = build(files, BuildOptions { title: Some("Flux"), ..BuildOptions::new(&layout, &meta) });
+        let group = &p.sections[0].groups[0];
+        assert_eq!((group.title.as_str(), group.author.as_deref(), group.description.as_deref()), ("Crosshair", Some("Mr. Meow"), Some("Adds a crosshair.")));
+        let ids: Vec<&str> = group.modules.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, vec!["PLUGIN"], "hook.Add in a plugin file goes to the plugin");
+        assert_eq!(group.modules[0].functions[0].realm, Realm::Client);
     }
 }

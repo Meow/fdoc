@@ -2,7 +2,7 @@
 
 use std::fmt::Write;
 
-use crate::doc::DocBlock;
+use crate::doc::{DocBlock, Realm};
 use crate::html::{esc, json_str};
 use crate::markdown;
 use crate::model::{Function, Group, Module, ModuleKind, Project};
@@ -341,6 +341,11 @@ fn module_page(project: &Project, group: &Group, m: &Module) -> String {
 
 fn flags(f: &Function) -> String {
     let mut out = String::new();
+    match f.realm {
+        Realm::Server => out.push_str(" <span class=\"flag flag-realm\">server</span>"),
+        Realm::Client => out.push_str(" <span class=\"flag flag-realm\">client</span>"),
+        Realm::Shared => {}
+    }
     if let Some(doc) = &f.doc {
         if doc.is_deprecated() {
             out.push_str(" <span class=\"flag flag-deprecated\">deprecated</span>");
@@ -555,6 +560,7 @@ mod tests {
     fn renders_pages() {
         let files = vec![
             ("lib/a.lua".to_string(), scan("--- Class A.\nclass 'A'\n--- Does x.\n-- @param n=1 [Number count]\n-- @return [Boolean ok]\n-- @see [A#other]\nfunction A:do_x(n)\nend\nfunction A:other() end")),
+            ("lib/sv_a.lua".to_string(), scan("function A:on_server() end")),
         ];
         let layout = Layout::default_for("Test");
         let meta = HashMap::new();
@@ -570,6 +576,8 @@ mod tests {
         assert!(page.contains("No documentation available."));
         assert!(page.contains("data-group=\"flux\" data-module=\"A\""));
         assert!(page.contains("<template id=\"module-functions\">"));
+        assert!(page.contains("on_server(</a> <span class=\"flag flag-realm\">server</span>") || page.contains("on_server()</a> <span class=\"flag flag-realm\">server</span>"), "{page}");
+        assert_eq!(page.matches("flag-realm").count(), 2, "only the server function is marked, in the summary and the details");
         let items = &pages.iter().find(|p| p.path == "assets/sidebar_items.js").unwrap().content;
         assert!(items.contains("{\"t\":\"A\",\"s\":\"A\"}"), "{items}");
         let data = &pages.iter().find(|p| p.path == "assets/search_data.js").unwrap().content;

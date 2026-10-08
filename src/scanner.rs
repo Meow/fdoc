@@ -36,7 +36,6 @@ pub enum Sep {
 }
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct FunctionDecl {
     /// Owner path, e.g. `ActiveRecord.Base` or `player_meta`; empty for globals.
     pub owner: String,
@@ -83,7 +82,6 @@ pub struct Category {
 /// A top-level `local NAME = <expr>`, such as `local PANEL = {}` or
 /// `local COMMAND = cw.command:New('A')`.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct LocalTable {
     pub name: String,
     pub line: usize,
@@ -98,7 +96,6 @@ pub struct LocalTable {
 
 /// A call that runs a hook, such as `hook.Run('Name', a, b)`.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct HookCall {
     pub name: String,
     /// Source rendering of each argument after the hook name.
@@ -114,7 +111,6 @@ pub struct HookCall {
 
 /// A `hook.Add('Name', id, handler)` call.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct HookAdd {
     pub name: String,
     /// The identifier, when it is a string literal.
@@ -127,7 +123,6 @@ pub struct HookAdd {
 }
 
 #[derive(Debug, Clone, Default)]
-#[allow(dead_code)]
 pub struct FileScan {
     pub functions: Vec<FunctionDecl>,
     pub classes: Vec<ClassDecl>,
@@ -211,7 +206,6 @@ struct Scanner {
 /// relative to the source root): `sv_`, `cl_` and `sh_` file name prefixes,
 /// `init.lua`, `cl_init.lua` and `shared.lua`, then the closest directory
 /// named `server`, `client` or `shared`; `Shared` otherwise.
-#[allow(dead_code)]
 pub fn path_realm(path: &str) -> Realm {
     let mut parts = path.split('/').rev();
     let file = parts.next().unwrap_or("").to_ascii_lowercase();
@@ -758,7 +752,7 @@ fn call_at(toks: &[Token], i: usize, path: &str) -> Option<Vec<Range<usize>>> {
     }
     let t = toks.get(j)?;
     if t.string().is_some() {
-        return Some(vec![j..j + 1]);
+        return Some(std::iter::once(j..j + 1).collect());
     }
     call_args(toks, j).map(|(args, _)| args)
 }

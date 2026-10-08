@@ -131,12 +131,35 @@ section title. The default layout keeps Flux's directories: `flux/`,
 
 Inside each group, functions are collected into modules by the table they are
 defined on: `function Foo.Bar:baz()` lands in `Foo.Bar`. Metatable locals such
-as `local player_meta = FindMetaTable('Player')` are shown as `Player`,
-`GM` hooks and the plugin object (`PLUGIN` or the name given to
-`PLUGIN:set_global`) get their own pages, free functions are listed under
-`Globals`, and per-file template objects (`PANEL`, `TOOL`, `CMD`, `SKIN`,
-`THEME`, `ENT`, ...) get one page per file, named after `vgui.Register` where
-available.
+as `local player_meta = FindMetaTable('Player')` are shown as `Player`, and
+free functions are listed under `Globals`.
+
+- **Hook handlers.** `GM`, `Schema` and the plugin table (`PLUGIN`, shown under
+  the name given to `PLUGIN:set_global` if any) get their own pages. Their
+  PascalCase methods are listed as hooks, the others as methods. Handlers
+  added with `hook.Add` join the page of the file's plugin or gamemode table,
+  else a `hook.Add` page.
+- **Hooks.** Every group that runs hooks (`hook.Run`, `hook.Call`,
+  `Plugin.call`, `cw.plugin:Call`, ...) gets a `Hooks` page with one entry per
+  hook name: its arguments, call sites and callers. The doc comment above a
+  call documents the hook.
+- **Objects.** A file-local table such as `local PANEL = {}`,
+  `local CLASS_TABLE = { __index = CLASS_TABLE }` or
+  `local COMMAND = cw.command:New('A')` gets a page of its own. It is named by
+  `@module`, `vgui.Register`, the constructor's string argument, a
+  `PrintName` / `name` field, or else after the file's library
+  (`cw.currency.Class`). Aliases such as `local PLUGIN = PLUGIN` are not
+  objects. Template objects that the loader injects (`PANEL`, `TOOL`, `ITEM`,
+  `ENT`, ...) get one page per file, and an entity, weapon or effect folder
+  (`init.lua`, `cl_init.lua`, `shared.lua`) gets one page named after the
+  folder.
+- **Realms.** Each function is marked server, client or shared, from
+  `@realm`, then `if SERVER` / `if CLIENT` blocks, then the file name. A
+  function defined once for the server and once for the client (such as in
+  `sv_kernel.lua` and `cl_kernel.lua`) is shown once, as shared.
+
+A file's doc comment documents the module its `@module` names, else the
+library it declares, else the only module its functions are in.
 
 Local functions are private and never documented.
 
