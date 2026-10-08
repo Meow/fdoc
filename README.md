@@ -175,8 +175,9 @@ free functions are listed under `Globals`.
 - **Definitions.** Objects that the framework loads from their own file,
   such as commands, items, factions, classes, roles, attributes, conditions,
   entities, weapons, effects, tools, panels, themes and skins, are
-  definitions rather than code. Every template object is one, labelled after
-  its name (`CMD` is a `Command`, `ENT` an `Entity`, `SWEP` a `Weapon`), and
+  definitions rather than code. Every template object but a `PACKAGE`
+  installer is one, labelled after its name (`CMD` is a `Command`, `ENT` an
+  `Entity`, `SWEP` a `Weapon`), and
   so is a file-local object named like one (`local PANEL = {}`,
   `local COMMAND = ...`, `local CLASS = ...`) or, failing that, an all-caps
   local created by a constructor call on a library, labelled after the

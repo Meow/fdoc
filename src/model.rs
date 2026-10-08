@@ -9,23 +9,24 @@ use crate::scanner::{path_realm, Category, FileScan, FunctionDecl, Sep};
 
 /// Template objects that the loader injects as globals and redefines per
 /// file (`PANEL:Init`, `ENT:Think`, ...), so each file becomes its own module,
-/// with the definition label of each. Objects declared as file locals are
-/// recognised from the declaration instead, see `is_object_init`.
-const PER_FILE_OBJECTS: [(&str, &str); 14] = [
-    ("PANEL", "Panel"),
-    ("CMD", "Command"),
-    ("SKIN", "Skin"),
-    ("THEME", "Theme"),
-    ("TOOL", "Tool"),
-    ("ENT", "Entity"),
-    ("SWEP", "Weapon"),
-    ("EFFECT", "Effect"),
-    ("ROLE", "Role"),
-    ("PACKAGE", "Package"),
-    ("ITEM", "Item"),
-    ("ATTRIBUTE", "Attribute"),
-    ("FACTION", "Faction"),
-    ("CONDITION", "Condition"),
+/// with the definition label of each; a `PACKAGE` installer is code and has
+/// none. Objects declared as file locals are recognised from the declaration
+/// instead, see `is_object_init`.
+const PER_FILE_OBJECTS: [(&str, Option<&str>); 14] = [
+    ("PANEL", Some("Panel")),
+    ("CMD", Some("Command")),
+    ("SKIN", Some("Skin")),
+    ("THEME", Some("Theme")),
+    ("TOOL", Some("Tool")),
+    ("ENT", Some("Entity")),
+    ("SWEP", Some("Weapon")),
+    ("EFFECT", Some("Effect")),
+    ("ROLE", Some("Role")),
+    ("PACKAGE", None),
+    ("ITEM", Some("Item")),
+    ("ATTRIBUTE", Some("Attribute")),
+    ("FACTION", Some("Faction")),
+    ("CONDITION", Some("Condition")),
 ];
 
 /// Template-style local names that make a definition besides those of
@@ -34,7 +35,7 @@ const LOCAL_DEFINITIONS: [(&str, &str); 2] = [("COMMAND", "Command"), ("CLASS", 
 
 /// Plural definition labels in the order they are listed in; others follow
 /// alphabetically.
-const DEFINITION_ORDER: [&str; 15] = ["Commands", "Items", "Factions", "Classes", "Roles", "Attributes", "Conditions", "Entities", "Weapons", "Effects", "Tools", "Panels", "Themes", "Skins", "Packages"];
+const DEFINITION_ORDER: [&str; 14] = ["Commands", "Items", "Factions", "Classes", "Roles", "Attributes", "Conditions", "Entities", "Weapons", "Effects", "Tools", "Panels", "Themes", "Skins"];
 
 /// File names of an entity, weapon or effect folder; the files of one folder
 /// form one module.
@@ -76,9 +77,15 @@ pub enum ModuleKind {
     Object { object: String },
 }
 
-/// The definition label of a per-file template object (`CMD` -> `Command`).
+/// True for a per-file template object (`CMD`, `PANEL`, `PACKAGE`, ...).
+fn is_per_file_object(object: &str) -> bool {
+    PER_FILE_OBJECTS.iter().any(|(o, _)| *o == object)
+}
+
+/// The definition label of a per-file template object (`CMD` -> `Command`),
+/// if it is a definition rather than code.
 fn per_file_label(object: &str) -> Option<&'static str> {
-    PER_FILE_OBJECTS.iter().find(|(o, _)| *o == object).map(|(_, label)| *label)
+    PER_FILE_OBJECTS.iter().find(|(o, _)| *o == object).and_then(|(_, label)| *label)
 }
 
 /// The plural of a definition label: `Entity` -> `Entities`, `Class` ->
@@ -762,7 +769,7 @@ fn plugin_tables(gb: &GroupBuilder) -> HashSet<String> {
     gb.files
         .iter()
         .flat_map(|(_, scan)| &scan.fields)
-        .filter(|(owner, field, _)| field == "author" && !owner.contains('.') && per_file_label(owner).is_none())
+        .filter(|(owner, field, _)| field == "author" && !owner.contains('.') && !is_per_file_object(owner))
         .map(|(owner, _, _)| owner.clone())
         .collect()
 }
@@ -843,8 +850,9 @@ fn owner_target(gb: &GroupBuilder, group_title: &str, path: &str, scan: &FileSca
         t.subtitle = Some(format!("Global functions of {group_title}"));
         return t;
     }
-    if let Some(label) = per_file_label(first) {
+    if is_per_file_object(first) {
         let kind = ModuleKind::Object { object: first.to_string() };
+        let label = per_file_label(first);
         let file = path.rsplit('/').next().unwrap_or(path);
         if ENTITY_FILES.contains(&file)
             && let Some(dir) = parent_dir(path)
@@ -852,15 +860,18 @@ fn owner_target(gb: &GroupBuilder, group_title: &str, path: &str, scan: &FileSca
             let folder = &path[..path.len() - file.len() - 1];
             let mut t = Target::new(format!("\u{2}entity\u{0}{first}\u{0}{folder}"), dir.to_string(), kind);
             t.title = title_field(scan, first).unwrap_or_else(|| dir.to_string());
-            t.subtitle = Some(format!("{label} defined in {}", rel_path(gb, folder)));
-            t.definition = Some(label.to_string());
+            t.subtitle = Some(format!("{} defined in {}", label.unwrap_or(first), rel_path(gb, folder)));
+            t.definition = label.map(str::to_string);
             return t;
         }
         let id = if first == "PANEL" { scan.vgui_name.clone().unwrap_or_else(|| file_stem(path).to_string()) } else { file_stem(path).to_string() };
         let mut t = Target::new(format!("\u{2}file\u{0}{first}\u{0}{path}"), id.clone(), kind);
         t.title = title_field(scan, first).unwrap_or(id);
-        t.subtitle = Some(format!("{label} defined in {rel}"));
-        t.definition = Some(label.to_string());
+        t.subtitle = Some(match label {
+            Some(label) => format!("{label} defined in {rel}"),
+            None => format!("Object {first} in {rel}"),
+        });
+        t.definition = label.map(str::to_string);
         return t;
     }
     if let Some(object) = handler_object(&f.owner, owner, &gb.plugin_global, plugin_tables) {
