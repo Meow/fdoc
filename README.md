@@ -134,8 +134,8 @@ what `*` matched. When a section has several `*` paths (a `*` path and the
 `<section>/<path>/<group>/` instead, where `<path>` is the path's components
 other than `*` joined with `-`, such as `plugins/gamemodes-a-plugins/stamina/`.
 Groups of different paths are never merged: a directory that is taken already
-gets a `-2`, `-3`, ... suffix. The default layout keeps Flux's directories:
-`flux/`, `packages/<name>/` and `plugins/<name>/`.
+gets a `-2`, `-3`, ... suffix. The default layout writes the core
+to `core/`, packages to `packages/<name>/` and plugins to `plugins/<name>/`.
 
 ### Modules
 

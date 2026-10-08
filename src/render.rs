@@ -810,13 +810,13 @@ mod tests {
         let pages = render_all(&project);
         let page = |path: &str| pages.iter().find(|p| p.path == path).map(|p| p.content.as_str()).unwrap_or_else(|| panic!("no page {path}"));
 
-        let a = page("flux/A.html");
+        let a = page("core/A.html");
         assert!(a.contains("<section class=\"detail\" id=\"do_x\">"));
-        assert!(a.contains("<a href=\"../flux/A.html#other\"><code>A#other</code></a>"));
+        assert!(a.contains("<a href=\"../core/A.html#other\"><code>A#other</code></a>"));
         assert!(a.contains("defaults to <code>1</code>"));
         assert!(a.contains("https://example.com/lib/a.lua#L10"));
         assert!(a.contains("No documentation available."));
-        assert!(a.contains("data-group=\"flux\" data-module=\"A\""));
+        assert!(a.contains("data-group=\"core\" data-module=\"A\""));
         assert!(a.contains("<template id=\"module-functions\">"));
         assert!(a.contains("<li data-realm=\"server\"><a href=\"#on_server\">on_server</a></li>"), "{a}");
         assert!(a.contains("on_server()</a><span class=\"realm realm-server\" title=\"Server-side\">server</span>"), "{a}");
@@ -838,29 +838,29 @@ mod tests {
         assert!(twin.contains("lib/cl_k.lua:2</a> <span class=\"realm realm-client\""), "{twin}");
 
         // The hooks page: arguments as code, callers as references, call sites.
-        let hooks = page("flux/Hooks.html");
+        let hooks = page("core/Hooks.html");
         assert!(hooks.contains("<h1>Hooks <span class=\"badge badge-hooks\">hooks</span>"));
         assert!(hooks.contains("<p class=\"lead\">Hooks called by Test</p>"), "{hooks}");
         assert!(hooks.contains("Spawned(self, 1)</a><span class=\"realm realm-shared\""), "{hooks}");
         assert!(hooks.contains("<h4>Arguments</h4>\n<ul class=\"params arguments\"><li><code>self</code></li><li><code>1</code></li></ul>"), "{hooks}");
-        assert!(hooks.contains("<h4>Called from</h4>\n<ul class=\"callers\"><li><a href=\"../flux/A.html#on_server\"><code>A:on_server</code></a></li></ul>"), "{hooks}");
+        assert!(hooks.contains("<h4>Called from</h4>\n<ul class=\"callers\"><li><a href=\"../core/A.html#on_server\"><code>A:on_server</code></a></li></ul>"), "{hooks}");
         assert!(hooks.contains("<h4>Call sites</h4>"));
         let sites = &hooks[hooks.find("<h4>Call sites</h4>").unwrap()..];
         assert!(sites.contains("lib/sv_a.lua:2</a> <span class=\"realm realm-server\""), "{sites}");
         assert!(sites.contains("lib/cl_k.lua:3</a> <span class=\"realm realm-client\""), "{sites}");
 
         // Handlers link to the hook they implement.
-        let gm = page("flux/GM.html");
-        assert!(gm.contains("<p class=\"hook-info\">Implements hook <a href=\"../flux/Hooks.html#Spawned\"><code>Spawned</code></a></p>"), "{gm}");
-        let added = page("flux/hook.Add.html");
-        assert!(added.contains("Implements hook <a href=\"../flux/Hooks.html#Spawned\"><code>Spawned</code></a><span class=\"sep\"> · </span><span class=\"muted\"><code>hook.Add</code> id: <code>my_id</code></span>"), "{added}");
+        let gm = page("core/GM.html");
+        assert!(gm.contains("<p class=\"hook-info\">Implements hook <a href=\"../core/Hooks.html#Spawned\"><code>Spawned</code></a></p>"), "{gm}");
+        let added = page("core/hook.Add.html");
+        assert!(added.contains("Implements hook <a href=\"../core/Hooks.html#Spawned\"><code>Spawned</code></a><span class=\"sep\"> · </span><span class=\"muted\"><code>hook.Add</code> id: <code>my_id</code></span>"), "{added}");
         assert!(added.contains("<h1>hook.Add <span class=\"badge badge-handlers\">handlers</span><span class=\"realm realm-client\""), "a one-realm module is marked in its header");
 
         let items = page("assets/sidebar_items.js");
         assert!(items.contains("{\"t\":\"A\",\"s\":\"A\"}"), "{items}");
         let data = page("assets/search_data.js");
         assert!(data.contains("\"t\":\"A:do_x(n)\""));
-        assert!(data.contains("\"t\":\"A:on_server()\",\"k\":\"function\",\"r\":\"flux/A.html#on_server\",\"d\":\"\",\"g\":\"A\",\"rl\":\"server\"}"), "{data}");
+        assert!(data.contains("\"t\":\"A:on_server()\",\"k\":\"function\",\"r\":\"core/A.html#on_server\",\"d\":\"\",\"g\":\"A\",\"rl\":\"server\"}"), "{data}");
         assert!(data.contains("\"t\":\"Spawned(self, 1)\",\"k\":\"hook\""), "{data}");
     }
 
@@ -909,7 +909,7 @@ end",
         let pages = render_all(&project);
         let page = |path: &str| pages.iter().find(|p| p.path == path).map(|p| p.content.as_str()).unwrap_or_else(|| panic!("no page {path}"));
 
-        let globals = page("flux/Globals.html");
+        let globals = page("core/Globals.html");
         assert_eq!(globals.matches("<section class=\"detail\"").count(), 3, "{globals}");
         let pill = "<span class=\"flag flag-environment\" title=\"Development only\">development</span>";
         assert!(globals.contains(&format!("print_metric(id, format)</a><span class=\"realm realm-shared\" title=\"Shared (server and client)\">shared</span> {pill}")), "{globals}");
@@ -930,7 +930,7 @@ end",
         let other = &reset[reset.find("<div class=\"otherwise\">").unwrap()..];
         assert!(other.contains("does not hold:</p>\n<p>Does nothing here.</p>\n</div>"), "a repeated summary paragraph is left out: {other}");
 
-        let seed = page("flux/Seed.html");
+        let seed = page("core/Seed.html");
         assert!(seed.contains("<h1>Seed <span class=\"badge badge-library\">library</span> <span class=\"flag flag-environment\" title=\"Production only\">production</span></h1>"), "{seed}");
         assert!(seed.contains("<p class=\"admonition-title\">Production only</p><p>Skipped when <code>SEED</code> is set.</p>"), "{seed}");
         let index = page("index.html");

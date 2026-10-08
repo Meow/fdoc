@@ -181,7 +181,7 @@ impl Layout {
             g
         };
         let mut sections = vec![
-            SectionSpec { title: title.to_string(), groups: vec![spec(".", true, "flux")] },
+            SectionSpec { title: title.to_string(), groups: vec![spec(".", true, "core")] },
             SectionSpec { title: "Packages".to_string(), groups: vec![spec("packages/*", false, "packages")] },
             SectionSpec { title: "Plugins".to_string(), groups: vec![spec("plugins/*", false, "plugins"), spec("plugins/*.lua", false, "plugins")] },
         ];
@@ -494,8 +494,8 @@ mod tests {
     fn default_layout_matches_flux() {
         let l = Layout::default_for("Flux");
         assert_eq!(l.sections[0].title, "Flux");
-        assert_eq!(place(&l, "gamemode/core/sh_util.lua"), Some((0, String::new(), "flux".into(), true)));
-        assert_eq!(place(&l, "packagespec.lua"), Some((0, String::new(), "flux".into(), true)));
+        assert_eq!(place(&l, "gamemode/core/sh_util.lua"), Some((0, String::new(), "core".into(), true)));
+        assert_eq!(place(&l, "packagespec.lua"), Some((0, String::new(), "core".into(), true)));
         assert_eq!(place(&l, "packages/flow/views/a.lua"), Some((1, "flow".into(), "packages/flow".into(), false)));
         assert_eq!(place(&l, "packages/loose.lua").map(|p| p.0), Some(0), "files directly in packages/ are core");
         assert_eq!(place(&l, "plugins/characters/plugin/sh_plugin.lua"), Some((2, "characters".into(), "plugins/characters".into(), false)));

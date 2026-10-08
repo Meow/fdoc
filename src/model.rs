@@ -1567,12 +1567,12 @@ mod tests {
         let layout = Layout::default_for("Flux");
         let meta = HashMap::new();
         let p = build(placed(&layout, files()), BuildOptions { fallback_title: Some("fallback"), ..BuildOptions::new(&layout, &meta) });
-        assert_eq!(p.resolve("Core::A#other").as_deref(), Some("flux/Core.A.html#other"));
-        assert_eq!(p.resolve("Core.A:do_x").as_deref(), Some("flux/Core.A.html#do_x"));
-        assert_eq!(p.resolve("Core.A").as_deref(), Some("flux/Core.A.html"));
-        assert_eq!(p.resolve("g").as_deref(), Some("flux/Globals.html#g"));
-        assert_eq!(p.resolve("player_meta#jump").as_deref(), Some("flux/Player.html#jump"));
-        assert_eq!(p.resolve("Player:jump()").as_deref(), Some("flux/Player.html#jump"));
+        assert_eq!(p.resolve("Core::A#other").as_deref(), Some("core/Core.A.html#other"));
+        assert_eq!(p.resolve("Core.A:do_x").as_deref(), Some("core/Core.A.html#do_x"));
+        assert_eq!(p.resolve("Core.A").as_deref(), Some("core/Core.A.html"));
+        assert_eq!(p.resolve("g").as_deref(), Some("core/Globals.html#g"));
+        assert_eq!(p.resolve("player_meta#jump").as_deref(), Some("core/Player.html#jump"));
+        assert_eq!(p.resolve("Player:jump()").as_deref(), Some("core/Player.html#jump"));
         assert_eq!(p.resolve("nothing"), None);
     }
 
@@ -1842,7 +1842,7 @@ if c then function split() end else function Other.split() end end",
         assert_eq!((hook_add.title.as_str(), hook_add.kind.badge(), hook_add.functions[0].realm), ("hook.Add", "handlers", Realm::Client));
 
         for key in ["hook:PlayerModelChanged", "Hooks#PlayerModelChanged", "Hooks:PlayerModelChanged", "Hooks.PlayerModelChanged"] {
-            assert_eq!(p.resolve(key).as_deref(), Some("flux/Hooks.html#PlayerModelChanged"), "{key}");
+            assert_eq!(p.resolve(key).as_deref(), Some("core/Hooks.html#PlayerModelChanged"), "{key}");
         }
         assert_eq!(p.resolve("PlayerModelChanged"), None, "hook names are not global functions");
         assert_eq!(p.resolve("cwStamina:PlayerModelChanged").as_deref(), Some("plugins/stamina/cwStamina.html#PlayerModelChanged"));
@@ -1887,10 +1887,10 @@ if c then function split() end else function Other.split() end end",
         assert_eq!((config.title.as_str(), config.summary().as_str()), ("manage  config", "The config system."));
         assert_eq!(module(modules, "Hooks").functions[0].callers, vec!["ManagePlayers:OnDisplay"]);
         for key in ["ManagePlayers", "Manage Players", " Manage Players "] {
-            assert_eq!(p.resolve(key).as_deref(), Some("flux/ManagePlayers.html"), "{key}");
+            assert_eq!(p.resolve(key).as_deref(), Some("core/ManagePlayers.html"), "{key}");
         }
         for key in ["ManagePlayers:OnDisplay", "ManagePlayers#OnDisplay", "Manage Players:OnDisplay"] {
-            assert_eq!(p.resolve(key).as_deref(), Some("flux/ManagePlayers.html#OnDisplay"), "{key}");
+            assert_eq!(p.resolve(key).as_deref(), Some("core/ManagePlayers.html#OnDisplay"), "{key}");
         }
         assert_eq!(p.resolve("Manage  Players"), None, "a spaced reference must match a key exactly");
         assert_eq!(p.resolve("Manage Players:Nothing"), None);
