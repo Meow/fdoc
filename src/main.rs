@@ -149,8 +149,8 @@ fn collect_lua_files(root: &Path, excludes: &[String], skip: Option<&Path>) -> R
     Ok(files)
 }
 
-/// Reads the `plugin.ini` in each group's source directory, by that
-/// directory.
+/// Reads the `plugin.yml` (else `plugin.ini`) in each group's source
+/// directory, by that directory.
 fn read_group_meta(source: &Path, files: &[PlacedFile]) -> Result<HashMap<String, GroupMeta>, String> {
     let mut meta = HashMap::new();
     let mut seen = HashSet::new();
@@ -158,10 +158,20 @@ fn read_group_meta(source: &Path, files: &[PlacedFile]) -> Result<HashMap<String
         if !seen.insert(place.source_dir.as_str()) {
             continue;
         }
-        let ini = source.join(&place.source_dir).join("plugin.ini");
-        if ini.is_file() {
+        let dir = source.join(&place.source_dir);
+        let yml = ["plugin.yml", "plugin.yaml"].map(|n| dir.join(n)).into_iter().find(|p| p.is_file());
+        let ini = dir.join("plugin.ini");
+        let parsed = if let Some(yml) = yml {
+            let text = fs::read(&yml).map_err(|e| format!("cannot read {}: {e}", yml.display()))?;
+            Some(layout::parse_plugin_yml(&String::from_utf8_lossy(&text)).map_err(|e| format!("{}: {e}", yml.display()))?)
+        } else if ini.is_file() {
             let text = fs::read(&ini).map_err(|e| format!("cannot read {}: {e}", ini.display()))?;
-            meta.insert(place.source_dir.clone(), layout::parse_plugin_ini(&String::from_utf8_lossy(&text)));
+            Some(layout::parse_plugin_ini(&String::from_utf8_lossy(&text)))
+        } else {
+            None
+        };
+        if let Some(parsed) = parsed {
+            meta.insert(place.source_dir.clone(), parsed);
         }
     }
     Ok(meta)

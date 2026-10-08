@@ -411,6 +411,32 @@ fn group(v: &Yaml, at: &str, warnings: &mut Vec<String>) -> Result<GroupSpec, St
     GroupSpec::new(&path, name, core)
 }
 
+/// Reads a Flux-style `plugin.yml`: a mapping with `name`, `description`,
+/// `author` and `version`. Other keys are ignored.
+pub fn parse_plugin_yml(text: &str) -> Result<GroupMeta, String> {
+    let docs = YamlLoader::load_from_str(text).map_err(|e| e.to_string())?;
+    let mut meta = GroupMeta::default();
+    let root = match docs.into_iter().next() {
+        None | Some(Yaml::Null) => return Ok(meta),
+        Some(Yaml::Hash(h)) => h,
+        Some(_) => return Err("the top level must be a mapping".to_string()),
+    };
+    for (k, v) in &root {
+        let key = key_name(k)?;
+        let slot = match key.as_str() {
+            "name" => &mut meta.name,
+            "description" => &mut meta.description,
+            "author" => &mut meta.author,
+            "version" => &mut meta.version,
+            _ => continue,
+        };
+        if let Some(value) = scalar(v, &key)?.filter(|v| !v.trim().is_empty()) {
+            slot.get_or_insert(value.trim().to_string());
+        }
+    }
+    Ok(meta)
+}
+
 /// Reads the `[Plugin]` section of a Clockwork `plugin.ini`:
 /// `name="Stamina"`, `author`, `description` and `compatibility` (or
 /// `version`). Values may be quoted and lines may end with `;`.
@@ -613,6 +639,14 @@ sections:
         assert!(Config::from_yaml("documented_only: maybe\n").is_err());
         assert_eq!(Config::from_yaml("").unwrap(), Config::default());
         assert_eq!(Config::from_yaml("title: X\n").unwrap().layout, None);
+    }
+
+    #[test]
+    fn reads_plugin_yml() {
+        let meta = parse_plugin_yml("name: 3D Texts\ndescription: Adds 3D texts.\nauthor: TeslaCloud Studios\nversion: 1.2\ndepends:\n  - admin\n").unwrap();
+        assert_eq!(meta, GroupMeta { name: Some("3D Texts".into()), description: Some("Adds 3D texts.".into()), author: Some("TeslaCloud Studios".into()), version: Some("1.2".into()) });
+        assert_eq!(parse_plugin_yml("").unwrap(), GroupMeta::default());
+        assert!(parse_plugin_yml("- a\n- b").is_err());
     }
 
     #[test]

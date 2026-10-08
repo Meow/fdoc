@@ -113,16 +113,18 @@ and a file of the same name in one section, such as `plugins/stamina/` and
 A group's title is the first of:
 
 1. its `name` in the configuration;
-2. the `name` in a Clockwork-style `plugin.ini` in the group's directory
-   (`plugins/stamina/plugin.ini` for `plugins/*`), which also supplies the
-   description, the author and the version (`version`, else `compatibility`);
+2. the `name` in a Flux-style `plugin.yml` or a Clockwork-style `plugin.ini`
+   in the group's directory (`plugins/stamina/plugin.yml` for `plugins/*`),
+   which also supplies the description, the author and the version (for
+   `plugin.ini`: `version`, else `compatibility`);
 3. the `name` in a `packagespec.lua` in the group's directory, which also
    supplies the summary, the author and the version;
 4. the name given to `PLUGIN:set_name`, along with `PLUGIN:set_description`
    and `PLUGIN:set_author`;
 5. the directory or file name that `*` matched.
 
-A core group is titled by its `name` or `plugin.ini`, else after its section.
+A core group is titled by its `name`, `plugin.yml` or `plugin.ini`, else after
+its section.
 
 Pages are written to `<section>/` for the first core group of a section and to
 `<section>/<group>/` for the others, where `<section>` is the lower-cased
