@@ -134,15 +134,19 @@ defined on: `function Foo.Bar:baz()` lands in `Foo.Bar`. Metatable locals such
 as `local player_meta = FindMetaTable('Player')` are shown as `Player`, and
 free functions are listed under `Globals`.
 
-- **Hook handlers.** `GM`, `Schema` and the plugin table (`PLUGIN`, shown under
-  the name given to `PLUGIN:set_global` if any) get their own pages. Their
-  PascalCase methods are listed as hooks, the others as methods. Handlers
-  added with `hook.Add` join the page of the file's plugin or gamemode table,
-  else a `hook.Add` page.
 - **Hooks.** Every group that runs hooks (`hook.Run`, `hook.Call`,
-  `Plugin.call`, `cw.plugin:Call`, ...) gets a `Hooks` page with one entry per
-  hook name: its arguments, call sites and callers. The doc comment above a
-  call documents the hook.
+  `Plugin.call`, `cw.plugin:Call`, ...) gets a `Hooks` page that defines
+  them, with one entry per hook name: the arguments of its widest call,
+  the functions that call it and every call site. The doc comment above a
+  call documents the hook; without `@param` tags, the call's arguments are
+  listed as the expressions they are.
+- **Hook handlers.** `GM`, `Schema` and the plugin table (`PLUGIN`, shown under
+  the name given to `PLUGIN:set_global` if any) get their own pages, badged
+  `gamemode`, `schema` and `plugin`. Their PascalCase methods are listed as
+  hooks, the others as methods. Handlers added with `hook.Add` join the page
+  of the file's plugin or gamemode table, else a `hook.Add` page (badged
+  `handlers`), and show their identifier. A handler of a hook the project
+  runs links to that hook's entry on a `Hooks` page.
 - **Objects.** A file-local table such as `local PANEL = {}`,
   `local CLASS_TABLE = { __index = CLASS_TABLE }` or
   `local COMMAND = cw.command:New('A')` gets a page of its own. It is named by
@@ -153,10 +157,14 @@ free functions are listed under `Globals`.
   `ENT`, ...) get one page per file, and an entity, weapon or effect folder
   (`init.lua`, `cl_init.lua`, `shared.lua`) gets one page named after the
   folder.
-- **Realms.** Each function is marked server, client or shared, from
-  `@realm`, then `if SERVER` / `if CLIENT` blocks, then the file name. A
-  function defined once for the server and once for the client (such as in
-  `sv_kernel.lua` and `cl_kernel.lua`) is shown once, as shared.
+- **Realms.** Each function is marked server (blue), client (orange) or
+  shared (both), from `@realm`, then `if SERVER` / `if CLIENT` blocks, then
+  the file name. The marker is shown in the summary, the details, the
+  sidebar and search results, and next to the title of a module whose
+  functions all run on one side. A function defined once for the server and
+  once for the client (such as in `sv_kernel.lua` and `cl_kernel.lua`) is
+  shown once, as shared, with both definitions; when their doc comments
+  differ, both are shown, the client's under "On the client".
 
 A file's doc comment documents the module its `@module` names, else the
 library it declares, else the only module its functions are in.

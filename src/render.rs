@@ -2,10 +2,10 @@
 
 use std::fmt::Write;
 
-use crate::doc::{DocBlock, Realm};
+use crate::doc::{DocBlock, Realm, Return};
 use crate::html::{esc, json_str};
 use crate::markdown;
-use crate::model::{Function, Group, Module, ModuleKind, Project};
+use crate::model::{Function, FunctionKind, Group, Module, ModuleKind, Project};
 use crate::scanner::Sep;
 
 pub struct Page {
@@ -154,7 +154,7 @@ fn module_functions_template(m: &Module) -> String {
     for (cat, fns) in m.grouped() {
         let _ = write!(out, "<li class=\"sidebar-category\" data-anchor=\"{}\">{}</li>", esc(&category_anchor(&cat.name)), esc(&cat.name));
         for f in fns {
-            let _ = write!(out, "<li><a href=\"#{}\">{}</a></li>", f.anchor, esc(&f.name));
+            let _ = write!(out, "<li data-realm=\"{}\"><a href=\"#{}\">{}</a></li>", realm_parts(f.realm).0, f.anchor, esc(&f.name));
         }
     }
     out.push_str("</ul></template>\n");
@@ -191,6 +191,42 @@ fn source_link(project: &Project, file: &str, line: usize) -> String {
         Some(base) => format!("<a class=\"source-link\" href=\"{}{}#L{line}\" title=\"View source\">{}:{line}</a>", esc(base), esc(file), esc(file)),
         None => format!("<span class=\"source-link\">{}:{line}</span>", esc(file)),
     }
+}
+
+/// The class suffix, label and tooltip of a realm.
+fn realm_parts(realm: Realm) -> (&'static str, &'static str) {
+    match realm {
+        Realm::Server => ("server", "Server-side"),
+        Realm::Client => ("client", "Client-side"),
+        Realm::Shared => ("shared", "Shared (server and client)"),
+    }
+}
+
+/// The colour-coded realm marker: orange for the client, blue for the
+/// server, split for shared code.
+fn realm_pill(realm: Realm) -> String {
+    let (name, title) = realm_parts(realm);
+    format!("<span class=\"realm realm-{name}\" title=\"{title}\">{name}</span>")
+}
+
+/// The realm every function of a module runs in, when it is one side only.
+fn module_realm(m: &Module) -> Option<Realm> {
+    let first = m.functions.first()?.realm;
+    (first != Realm::Shared && m.functions.iter().all(|f| f.realm == first)).then_some(first)
+}
+
+/// Splits a Markdown text into its first paragraph and the rest.
+fn split_first_paragraph(text: &str) -> (String, String) {
+    let lines: Vec<&str> = text.trim().lines().collect();
+    match lines.iter().position(|l| l.trim().is_empty()) {
+        Some(p) => (lines[..p].join("\n"), lines[p..].join("\n").trim().to_string()),
+        None => (lines.join("\n"), String::new()),
+    }
+}
+
+/// The first sentence of a free-form description, as used in listings.
+fn text_summary(text: &str) -> String {
+    DocBlock { description: text.to_string(), ..DocBlock::default() }.summary()
 }
 
 fn type_html(ty: &Option<String>) -> String {
@@ -231,7 +267,7 @@ fn project_index(project: &Project) -> String {
                     dir = group.dir,
                     title = esc(&group.title),
                     n = group.modules.len(),
-                    desc = group.description.as_deref().map(|d| md_inline(project, &root, d)).unwrap_or_default(),
+                    desc = group.description.as_deref().map(|d| md_inline(project, &root, &text_summary(d))).unwrap_or_default(),
                 );
             }
         }
@@ -265,7 +301,11 @@ fn group_index(project: &Project, group: &Group) -> String {
     }
     body.push_str("</h1>\n");
     if let Some(d) = &group.description {
-        let _ = writeln!(body, "<p class=\"lead\">{}</p>", md_inline(project, &root, d));
+        let (lead, rest) = split_first_paragraph(d);
+        let _ = writeln!(body, "<p class=\"lead\">{}</p>", md_inline(project, &root, &lead));
+        if !rest.is_empty() {
+            body.push_str(&md(project, &root, &rest));
+        }
     }
     if let Some(a) = &group.author {
         let _ = writeln!(body, "<p class=\"muted\">By {}</p>", esc(a));
@@ -280,8 +320,15 @@ fn module_page(project: &Project, group: &Group, m: &Module) -> String {
     let root = root_for(&path);
     let mut body = String::new();
 
-    let _ = write!(body, "<div class=\"page-header\"><h1>{} <span class=\"badge badge-{badge}\">{badge}</span></h1>", esc(&m.title), badge = m.kind.badge());
-    if let Some(sub) = &m.subtitle {
+    let _ = write!(
+        body,
+        "<div class=\"page-header\"><h1>{} <span class=\"badge badge-{badge}\">{badge}</span>{realm}</h1>",
+        esc(&m.title),
+        badge = m.kind.badge(),
+        realm = module_realm(m).map(realm_pill).unwrap_or_default(),
+    );
+    let lead = if m.kind == ModuleKind::Hooks { m.subtitle.as_ref() } else { None };
+    if let Some(sub) = m.subtitle.as_ref().filter(|_| lead.is_none()) {
         let _ = write!(body, "<p class=\"subtitle\">{}</p>", esc(sub));
     }
     if let ModuleKind::Class { extends: Some(base) } = &m.kind {
@@ -291,6 +338,9 @@ fn module_page(project: &Project, group: &Group, m: &Module) -> String {
         let _ = write!(body, "<p class=\"subtitle\">Part of <a href=\"{root}{}/index.html\">{}</a></p>", group.dir, esc(&group.title));
     }
     body.push_str("</div>\n");
+    if let Some(lead) = lead {
+        let _ = writeln!(body, "<p class=\"lead\">{}</p>", esc(lead));
+    }
 
     if let Some(doc) = &m.doc {
         body.push_str("<section class=\"moduledoc\">\n");
@@ -304,9 +354,10 @@ fn module_page(project: &Project, group: &Group, m: &Module) -> String {
         for (cat, fns) in &grouped {
             let _ = writeln!(body, "<div class=\"summary-group\"><h3>{}</h3>", esc(&cat.name));
             for f in fns {
-                let _ = writeln!(body, "<div class=\"summary-row\"><div class=\"summary-signature\"><a href=\"#{anchor}\">{sig}</a>{flags}</div><div class=\"summary-synopsis\">{desc}</div></div>",
+                let _ = writeln!(body, "<div class=\"summary-row\"><div class=\"summary-signature\"><a href=\"#{anchor}\">{sig}</a>{realm}{flags}</div><div class=\"summary-synopsis\">{desc}</div></div>",
                     anchor = f.anchor,
                     sig = esc(&f.signature()),
+                    realm = realm_pill(f.realm),
                     flags = flags(f),
                     desc = md_inline(project, &root, &f.summary()),
                 );
@@ -341,11 +392,6 @@ fn module_page(project: &Project, group: &Group, m: &Module) -> String {
 
 fn flags(f: &Function) -> String {
     let mut out = String::new();
-    match f.realm {
-        Realm::Server => out.push_str(" <span class=\"flag flag-realm\">server</span>"),
-        Realm::Client => out.push_str(" <span class=\"flag flag-realm\">client</span>"),
-        Realm::Shared => {}
-    }
     if let Some(doc) = &f.doc {
         if doc.is_deprecated() {
             out.push_str(" <span class=\"flag flag-deprecated\">deprecated</span>");
@@ -359,7 +405,7 @@ fn flags(f: &Function) -> String {
 
 fn function_detail(project: &Project, root: &str, f: &Function) -> String {
     let mut out = String::new();
-    let _ = writeln!(out, "<section class=\"detail\" id=\"{anchor}\">\n<div class=\"detail-header\">\n<h3 class=\"signature\"><span class=\"owner\">{owner}</span>{name}<span class=\"params\">({params})</span></h3>{flags}\n<a href=\"#{anchor}\" class=\"detail-link\" title=\"Link to this function\">{icon}</a>\n{source}\n</div>\n<section class=\"docstring\">",
+    let _ = writeln!(out, "<section class=\"detail\" id=\"{anchor}\">\n<div class=\"detail-header\">\n<h3 class=\"signature\"><span class=\"owner\">{owner}</span>{name}<span class=\"params\">({params})</span></h3> {realm}{flags}\n<a href=\"#{anchor}\" class=\"detail-link\" title=\"Link to this function\">{icon}</a>\n{source}\n</div>\n<section class=\"docstring\">",
         anchor = f.anchor,
         owner = match f.sep {
             Sep::None => String::new(),
@@ -368,15 +414,109 @@ fn function_detail(project: &Project, root: &str, f: &Function) -> String {
         },
         name = esc(&f.name),
         params = esc(&f.params.join(", ")),
+        realm = realm_pill(f.realm),
         flags = flags(f),
         icon = LINK_ICON,
         source = source_link(project, &f.file, f.line),
     );
-    match &f.doc {
-        Some(doc) => out.push_str(&doc_body(project, root, doc, Some(f))),
-        None => out.push_str("<p class=\"muted\">No documentation available.</p>\n"),
+    out.push_str(&hook_info(project, root, f));
+    match (&f.doc, &f.client_doc) {
+        (doc, Some(client)) => {
+            let (realm, label) = match f.sources[0].2 {
+                Realm::Shared => ("shared", "Shared"),
+                _ => ("server", "On the server"),
+            };
+            let _ = writeln!(out, "<div class=\"realm-doc realm-doc-{realm}\"><p class=\"realm-doc-title\">{label}</p>");
+            match doc {
+                Some(doc) => out.push_str(&doc_body(project, root, doc, Some(f))),
+                None => out.push_str("<p class=\"muted\">No documentation available.</p>\n"),
+            }
+            out.push_str("</div>\n<div class=\"realm-doc realm-doc-client\"><p class=\"realm-doc-title\">On the client</p>\n");
+            out.push_str(&doc_body(project, root, client, Some(f)));
+            out.push_str("</div>\n");
+        }
+        (Some(doc), None) => out.push_str(&doc_body(project, root, doc, Some(f))),
+        (None, None) => {
+            out.push_str("<p class=\"muted\">No documentation available.</p>\n");
+            if f.kind == FunctionKind::Hook {
+                out.push_str(&arguments_list(f));
+            }
+        }
+    }
+    if f.kind == FunctionKind::Hook {
+        if !f.callers.is_empty() {
+            out.push_str("<h4>Called from</h4>\n<ul class=\"callers\">");
+            for caller in &f.callers {
+                let _ = write!(out, "<li>{}</li>", reference_link(project, root, caller));
+            }
+            out.push_str("</ul>\n");
+        }
+        out.push_str(&sources_list("Call sites", project, f));
+    } else if f.sources.len() > 1 {
+        out.push_str(&sources_list("Defined in", project, f));
     }
     out.push_str("</section>\n</section>\n");
+    out
+}
+
+/// The line under a hook handler's header: the hook it implements and the
+/// `hook.Add` identifier.
+fn hook_info(project: &Project, root: &str, f: &Function) -> String {
+    let mut parts = Vec::new();
+    if let Some(key) = &f.implements {
+        let name = key.strip_prefix("hook:").unwrap_or(key);
+        let link = match project.resolve(key) {
+            Some(url) => format!("<a href=\"{root}{}\"><code>{}</code></a>", esc(&url), esc(name)),
+            None => format!("<code>{}</code>", esc(name)),
+        };
+        parts.push(format!("Implements hook {link}"));
+    }
+    if f.kind == FunctionKind::HookAdd {
+        parts.push(match &f.hook_id {
+            Some(id) => format!("<span class=\"muted\"><code>hook.Add</code> id: <code>{}</code></span>", esc(id)),
+            None => "<span class=\"muted\">Added with <code>hook.Add</code></span>".to_string(),
+        });
+    }
+    if parts.is_empty() {
+        return String::new();
+    }
+    format!("<p class=\"hook-info\">{}</p>\n", parts.join("<span class=\"sep\"> · </span>"))
+}
+
+/// The definitions or call sites of a function, each with its realm.
+fn sources_list(title: &str, project: &Project, f: &Function) -> String {
+    let mut out = format!("<h4>{title}</h4>\n<ul class=\"source-list\">");
+    for (file, line, realm) in &f.sources {
+        let _ = write!(out, "<li>{} {}</li>", source_link(project, file, *line), realm_pill(*realm));
+    }
+    out.push_str("</ul>\n");
+    out
+}
+
+/// The arguments a hook is called with. They are expressions at the call
+/// site rather than parameter names, so they are shown as code.
+fn arguments_list(f: &Function) -> String {
+    if f.params.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from("<h4>Arguments</h4>\n<ul class=\"params arguments\">");
+    for p in &f.params {
+        let _ = write!(out, "<li><code>{}</code></li>", esc(p));
+    }
+    out.push_str("</ul>\n");
+    out
+}
+
+fn returns_list(project: &Project, root: &str, returns: &[Return]) -> String {
+    let mut out = String::from("<ul class=\"returns\">");
+    for r in returns {
+        let _ = write!(out, "<li>{}", type_html(&r.ty));
+        if !r.description.is_empty() {
+            let _ = write!(out, " <span class=\"desc\">{}</span>", md_inline(project, root, &r.description));
+        }
+        out.push_str("</li>");
+    }
+    out.push_str("</ul>\n");
     out
 }
 
@@ -422,6 +562,10 @@ fn doc_body(project: &Project, root: &str, doc: &DocBlock, f: Option<&Function>)
             if !v.params.is_empty() {
                 out.push_str(&params_list(project, root, &v.params));
             }
+            if !v.returns.is_empty() {
+                out.push_str("<h5>Returns</h5>\n");
+                out.push_str(&returns_list(project, root, &v.returns));
+            }
             out.push_str("</li>\n");
         }
         out.push_str("</ul>\n");
@@ -430,6 +574,8 @@ fn doc_body(project: &Project, root: &str, doc: &DocBlock, f: Option<&Function>)
     if !doc.params.is_empty() {
         out.push_str("<h4>Parameters</h4>\n");
         out.push_str(&params_list(project, root, &doc.params));
+    } else if let Some(f) = f.filter(|f| f.kind == FunctionKind::Hook) {
+        out.push_str(&arguments_list(f));
     } else if let Some(f) = f {
         // Undocumented parameters are still listed from the signature.
         if !f.params.is_empty() && doc.variants.is_empty() {
@@ -442,15 +588,8 @@ fn doc_body(project: &Project, root: &str, doc: &DocBlock, f: Option<&Function>)
     }
 
     if !doc.returns.is_empty() {
-        out.push_str("<h4>Returns</h4>\n<ul class=\"returns\">");
-        for r in &doc.returns {
-            let _ = write!(out, "<li>{}", type_html(&r.ty));
-            if !r.description.is_empty() {
-                let _ = write!(out, " <span class=\"desc\">{}</span>", md_inline(project, root, &r.description));
-            }
-            out.push_str("</li>");
-        }
-        out.push_str("</ul>\n");
+        out.push_str("<h4>Returns</h4>\n");
+        out.push_str(&returns_list(project, root, &doc.returns));
     }
 
     if !doc.aliases.is_empty() {
@@ -516,22 +655,31 @@ fn search_page(project: &Project) -> String {
     layout(project, "search.html", "Search", Active::default(), body)
 }
 
+/// The search index: one entry per group, module and function, with its
+/// title (`t`), kind (`k`), URL (`r`), synopsis (`d`), parent (`g`) and,
+/// for functions, realm (`rl`).
 fn search_data(project: &Project) -> String {
     let mut items: Vec<String> = Vec::new();
-    let entry = |title: &str, kind: &str, url: &str, desc: &str, group: &str| {
+    let entry = |title: &str, kind: &str, url: &str, desc: &str, group: &str, realm: Option<Realm>| {
         let desc = truncate(desc, 140);
-        format!("{{\"t\":{},\"k\":{},\"r\":{},\"d\":{},\"g\":{}}}", json_str(title), json_str(kind), json_str(url), json_str(&desc), json_str(group))
+        let realm = realm.map(|r| format!(",\"rl\":\"{}\"", realm_parts(r).0)).unwrap_or_default();
+        format!("{{\"t\":{},\"k\":{},\"r\":{},\"d\":{},\"g\":{}{realm}}}", json_str(title), json_str(kind), json_str(url), json_str(&desc), json_str(group))
     };
     for section in &project.sections {
         for group in &section.groups {
             if !group.is_core {
-                items.push(entry(&group.title, "group", &format!("{}/index.html", group.dir), group.description.as_deref().unwrap_or(""), &section.title));
+                items.push(entry(&group.title, "group", &format!("{}/index.html", group.dir), &text_summary(group.description.as_deref().unwrap_or("")), &section.title, None));
             }
             for m in &group.modules {
                 let page = format!("{}/{}.html", group.dir, m.slug);
-                items.push(entry(&m.title, m.kind.badge(), &page, &m.summary(), &group.title));
+                items.push(entry(&m.title, m.kind.badge(), &page, &m.summary(), &group.title, None));
                 for f in &m.functions {
-                    items.push(entry(&f.qualified_signature(), "function", &format!("{page}#{}", f.anchor), &f.summary(), &m.title));
+                    let kind = match f.kind {
+                        FunctionKind::Declared => "function",
+                        FunctionKind::Hook => "hook",
+                        FunctionKind::HookAdd => "handler",
+                    };
+                    items.push(entry(&f.qualified_signature(), kind, &format!("{page}#{}", f.anchor), &f.summary(), &m.title, Some(f.realm)));
                 }
             }
         }
@@ -559,28 +707,73 @@ mod tests {
     #[test]
     fn renders_pages() {
         let files = vec![
-            ("lib/a.lua".to_string(), scan("--- Class A.\nclass 'A'\n--- Does x.\n-- @param n=1 [Number count]\n-- @return [Boolean ok]\n-- @see [A#other]\nfunction A:do_x(n)\nend\nfunction A:other() end")),
-            ("lib/sv_a.lua".to_string(), scan("function A:on_server() end")),
+            (
+                "lib/a.lua".to_string(),
+                scan("--- Class A.\nclass 'A'\n--- Does x.\n-- @param n=1 [Number count]\n-- @return [Boolean ok]\n-- @variant A:do_x(n, m)\n--   @param m [String mode]\n--   @return [String text]\n-- @see [A#other]\nfunction A:do_x(n)\nend\nfunction A:other() end"),
+            ),
+            ("lib/sv_a.lua".to_string(), scan("function A:on_server()\n  hook.Run('Spawned', self, 1)\nend")),
+            ("lib/sv_k.lua".to_string(), scan("--- Server twin.\nfunction A:twin() end")),
+            ("lib/cl_k.lua".to_string(), scan("--- Client twin.\nfunction A:twin() end\nhook.Run('Spawned', LocalPlayer())")),
+            ("lib/sh_gm.lua".to_string(), scan("--- Handles spawns.\nfunction GM:Spawned(obj, n) end")),
+            ("lib/cl_add.lua".to_string(), scan("hook.Add('Spawned', 'my_id', function(obj) end)")),
         ];
         let layout = Layout::default_for("Test");
         let meta = HashMap::new();
         let project = build(files, BuildOptions { title: Some("Test"), source_url: Some("https://example.com/"), ..BuildOptions::new(&layout, &meta) });
         let pages = render_all(&project);
-        let paths: Vec<&str> = pages.iter().map(|p| p.path.as_str()).collect();
-        assert!(paths.contains(&"index.html") && paths.contains(&"flux/A.html") && paths.contains(&"assets/search_data.js"));
-        let page = &pages.iter().find(|p| p.path == "flux/A.html").unwrap().content;
-        assert!(page.contains("<section class=\"detail\" id=\"do_x\">"));
-        assert!(page.contains("<a href=\"../flux/A.html#other\"><code>A#other</code></a>"));
-        assert!(page.contains("defaults to <code>1</code>"));
-        assert!(page.contains("https://example.com/lib/a.lua#L7"));
-        assert!(page.contains("No documentation available."));
-        assert!(page.contains("data-group=\"flux\" data-module=\"A\""));
-        assert!(page.contains("<template id=\"module-functions\">"));
-        assert!(page.contains("on_server(</a> <span class=\"flag flag-realm\">server</span>") || page.contains("on_server()</a> <span class=\"flag flag-realm\">server</span>"), "{page}");
-        assert_eq!(page.matches("flag-realm").count(), 2, "only the server function is marked, in the summary and the details");
-        let items = &pages.iter().find(|p| p.path == "assets/sidebar_items.js").unwrap().content;
+        let page = |path: &str| pages.iter().find(|p| p.path == path).map(|p| p.content.as_str()).unwrap_or_else(|| panic!("no page {path}"));
+
+        let a = page("flux/A.html");
+        assert!(a.contains("<section class=\"detail\" id=\"do_x\">"));
+        assert!(a.contains("<a href=\"../flux/A.html#other\"><code>A#other</code></a>"));
+        assert!(a.contains("defaults to <code>1</code>"));
+        assert!(a.contains("https://example.com/lib/a.lua#L10"));
+        assert!(a.contains("No documentation available."));
+        assert!(a.contains("data-group=\"flux\" data-module=\"A\""));
+        assert!(a.contains("<template id=\"module-functions\">"));
+        assert!(a.contains("<li data-realm=\"server\"><a href=\"#on_server\">on_server</a></li>"), "{a}");
+        assert!(a.contains("on_server()</a><span class=\"realm realm-server\" title=\"Server-side\">server</span>"), "{a}");
+        assert!(a.contains("<span class=\"realm realm-shared\" title=\"Shared (server and client)\">shared</span>"));
+        assert!(!a.contains("flag-realm"));
+        assert!(!a.contains("<h1>A <span class=\"badge badge-class\">class</span><span class=\"realm"), "mixed realms are not marked in the header");
+
+        // Variant returns sit under the variant's parameters, the others below.
+        let variant = &a[a.find("<ul class=\"variants\">").unwrap()..];
+        assert!(variant.starts_with("<ul class=\"variants\">\n<li><code class=\"variant-signature\">A:do_x(n, m)</code><ul class=\"params\"><li><span class=\"param-name\">m</span>"), "{variant}");
+        assert!(variant.contains("<h5>Returns</h5>\n<ul class=\"returns\"><li><span class=\"type\">String</span> <span class=\"desc\">text</span></li></ul>\n</li>"), "{variant}");
+        assert!(variant.contains("<h4>Returns</h4>\n<ul class=\"returns\"><li><span class=\"type\">Boolean</span> <span class=\"desc\">ok</span></li></ul>"), "{variant}");
+
+        // Merged realm twins: both docs and both definitions.
+        let twin = &a[a.find("id=\"twin\"").unwrap()..];
+        assert!(twin.contains("<div class=\"realm-doc realm-doc-server\"><p class=\"realm-doc-title\">On the server</p>\n<p>Server twin.</p>"), "{twin}");
+        assert!(twin.contains("<p class=\"realm-doc-title\">On the client</p>\n<p>Client twin.</p>"), "{twin}");
+        assert!(twin.contains("<h4>Defined in</h4>\n<ul class=\"source-list\"><li><a class=\"source-link\" href=\"https://example.com/lib/sv_k.lua#L2\" title=\"View source\">lib/sv_k.lua:2</a> <span class=\"realm realm-server\""), "{twin}");
+        assert!(twin.contains("lib/cl_k.lua:2</a> <span class=\"realm realm-client\""), "{twin}");
+
+        // The hooks page: arguments as code, callers as references, call sites.
+        let hooks = page("flux/Hooks.html");
+        assert!(hooks.contains("<h1>Hooks <span class=\"badge badge-hooks\">hooks</span>"));
+        assert!(hooks.contains("<p class=\"lead\">Hooks called by Test</p>"), "{hooks}");
+        assert!(hooks.contains("Spawned(self, 1)</a><span class=\"realm realm-shared\""), "{hooks}");
+        assert!(hooks.contains("<h4>Arguments</h4>\n<ul class=\"params arguments\"><li><code>self</code></li><li><code>1</code></li></ul>"), "{hooks}");
+        assert!(hooks.contains("<h4>Called from</h4>\n<ul class=\"callers\"><li><a href=\"../flux/A.html#on_server\"><code>A:on_server</code></a></li></ul>"), "{hooks}");
+        assert!(hooks.contains("<h4>Call sites</h4>"));
+        let sites = &hooks[hooks.find("<h4>Call sites</h4>").unwrap()..];
+        assert!(sites.contains("lib/sv_a.lua:2</a> <span class=\"realm realm-server\""), "{sites}");
+        assert!(sites.contains("lib/cl_k.lua:3</a> <span class=\"realm realm-client\""), "{sites}");
+
+        // Handlers link to the hook they implement.
+        let gm = page("flux/GM.html");
+        assert!(gm.contains("<p class=\"hook-info\">Implements hook <a href=\"../flux/Hooks.html#Spawned\"><code>Spawned</code></a></p>"), "{gm}");
+        let added = page("flux/hook.Add.html");
+        assert!(added.contains("Implements hook <a href=\"../flux/Hooks.html#Spawned\"><code>Spawned</code></a><span class=\"sep\"> · </span><span class=\"muted\"><code>hook.Add</code> id: <code>my_id</code></span>"), "{added}");
+        assert!(added.contains("<h1>hook.Add <span class=\"badge badge-handlers\">handlers</span><span class=\"realm realm-client\""), "a one-realm module is marked in its header");
+
+        let items = page("assets/sidebar_items.js");
         assert!(items.contains("{\"t\":\"A\",\"s\":\"A\"}"), "{items}");
-        let data = &pages.iter().find(|p| p.path == "assets/search_data.js").unwrap().content;
+        let data = page("assets/search_data.js");
         assert!(data.contains("\"t\":\"A:do_x(n)\""));
+        assert!(data.contains("\"t\":\"A:on_server()\",\"k\":\"function\",\"r\":\"flux/A.html#on_server\",\"d\":\"\",\"g\":\"A\",\"rl\":\"server\"}"), "{data}");
+        assert!(data.contains("\"t\":\"Spawned(self, 1)\",\"k\":\"hook\""), "{data}");
     }
 }

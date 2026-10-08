@@ -111,7 +111,6 @@ pub struct Function {
     /// documented (`Player:GetData`, `cw.core:Initialize`, `helper`).
     pub callers: Vec<String>,
     /// For `hook.Add` handlers: the identifier, when it is a string literal.
-    #[allow(dead_code)]
     pub hook_id: Option<String>,
     /// For functions in the `Hooks` category: the reference key (`hook:Name`)
     /// of the hook of that name the project runs, if any.
