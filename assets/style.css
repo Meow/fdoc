@@ -34,6 +34,8 @@
   --realm-client: #e07b14;
   --realm-client-background: #fdeedd;
   --realm-client-text: #a14f08;
+  --realm-shared-background: #913591;
+  --realm-shared-text: #fbe6f6;
   --hl-k: #a626a4;
   --hl-s: #50a14f;
   --hl-c: #9a9ca3;
@@ -82,6 +84,8 @@
     --realm-client: #f39a3d;
     --realm-client-background: #33220f;
     --realm-client-text: #ffc58a;
+    --realm-shared-background: #913591;
+    --realm-shared-text: #fbe6f6;
     --hl-k: #c678dd;
     --hl-s: #98c379;
     --hl-c: #6f7480;
@@ -127,6 +131,8 @@
   --realm-client: #f39a3d;
   --realm-client-background: #33220f;
   --realm-client-text: #ffc58a;
+  --realm-shared-background: #913591;
+  --realm-shared-text: #fbe6f6;
   --hl-k: #c678dd;
   --hl-s: #98c379;
   --hl-c: #6f7480;
@@ -322,12 +328,12 @@ h1 .badge, h1 .realm, h1 .flag { font-size: 0.75rem; }
   padding: 0 0.6em 0 0.5em; border-radius: 999px; margin-left: 0.5em; white-space: nowrap;
   text-transform: uppercase; letter-spacing: 0.04em; cursor: default;
 }
-.realm::before { content: ""; flex: none; width: 0.6em; height: 0.6em; border-radius: 50%; background: var(--realm-dot); }
+.realm::before { content: ""; flex: none; width: 0.85em; height: 0.85em; border-radius: 50%; background: var(--realm-dot); }
 .realm-server { --realm-dot: var(--realm-server); background: var(--realm-server-background); color: var(--realm-server-text); }
 .realm-client { --realm-dot: var(--realm-client); background: var(--realm-client-background); color: var(--realm-client-text); }
-.realm-shared { background: linear-gradient(90deg, var(--realm-client-background) 50%, var(--realm-server-background) 50%); color: var(--text); }
+.realm-shared { background: var(--realm-shared-background); color: var(--realm-shared-text); }
 .realm-shared::before, .realm-dot-shared { background: linear-gradient(90deg, var(--realm-client) 50%, var(--realm-server) 50%); }
-.realm-dot { display: inline-block; flex: none; width: 0.5em; height: 0.5em; border-radius: 50%; margin-right: 0.55em; vertical-align: 0.08em; }
+.realm-dot { display: inline-block; flex: none; width: 0.75em; height: 0.75em; border-radius: 50%; margin-right: 0.55em; vertical-align: 0.08em; }
 .realm-dot-server { background: var(--realm-server); }
 .realm-dot-client { background: var(--realm-client); }
 .flag {
