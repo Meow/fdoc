@@ -63,7 +63,15 @@ Local functions are private and never documented.
 
 A doc comment starts with `---` and continues on the following `--` lines. It
 documents the declaration that directly follows it: a `function`, a
-`name = function` assignment or a `class 'Name'` declaration.
+`name = function` assignment, a `class 'Name'` declaration, a top-level
+`local NAME = ...` (such as `local PANEL = {}`), or a statement that runs a
+hook (`hook.Run('Name', ...)`) or adds one (`hook.Add('Name', ...)`).
+
+The first doc comment that is not attached to anything and comes before the
+first declaration of the file documents the file itself; `@module` names the
+module it describes.
+
+The summary shown in listings is the first sentence of the description.
 
 ```lua
 --- Summary line, followed by a longer description in Markdown.
@@ -88,13 +96,15 @@ Supported tags:
 | --- | --- |
 | `@param name[=default] [Type description]` | A parameter. The default marks it optional. |
 | `@return [Type description, Type description]` | Return values; a comma followed by a type starts the next value. |
-| `@variant name(a, b)` | An alternative signature. Indented `@param` lines below it belong to the variant, and the text just above it describes it. |
+| `@variant name(a, b)` | An alternative signature. Indented `@param` and `@return` lines below it belong to the variant, and the text just above it describes it. A `@return` that is not indented applies to the whole function. |
 | `@see [Reference]` or `@see Reference` | A related function or module (`Owner#name`, `Owner:name`, `Owner.name`, `name` or `Owner`). |
 | `@warning [Label] text` | A warning box. The `Internal` label marks the function as internal. |
 | `@deprecation [reason]` | Marks the function as deprecated. |
 | `@deprecation_version [version]` | The version the deprecation starts at. |
 | `@alias [Other.name]` | Another name the function is available under. |
 | `@category [Name]` | On its own, starts a named section that groups the functions below it in the same file. The text after it describes the section. |
+| `@realm [server\|client\|shared]` | Where the code runs, overriding the realm derived from the file name (`sv_`, `cl_`, `sh_`, `init.lua`, ...) and from `if SERVER` / `if CLIENT` blocks. |
+| `@module [Name]` | In the file's doc comment, the module the file documents (`@module [cw.currency]`); above a `local` table, the name of the object it defines. |
 | `@ignore` | Skips the declaration. |
 
 Bracketed tag bodies may continue on the next lines. Inline code that names a
