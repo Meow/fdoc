@@ -31,11 +31,11 @@ const MAX_CONDITION_LEN: usize = 60;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Sep {
-    /// `Owner.name` — a function stored in a table.
+    /// `Owner.name` - a function stored in a table.
     Dot,
-    /// `Owner:name` — a method.
+    /// `Owner:name` - a method.
     Colon,
-    /// `name` — a global function.
+    /// `name` - a global function.
     None,
 }
 

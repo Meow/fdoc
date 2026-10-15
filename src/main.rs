@@ -1,4 +1,4 @@
-//! fdoc — generates HTML documentation from the doc comments of a Lua
+//! fdoc - generates HTML documentation from the doc comments of a Lua
 //! code base.
 
 mod doc;
@@ -20,7 +20,7 @@ use lexer::Syntax;
 use model::{BuildOptions, PlacedFile};
 
 const USAGE: &str = "\
-fdoc — HTML documentation generator for Lua doc comments
+fdoc - HTML documentation generator for Lua doc comments
 
 Usage: fdoc [OPTIONS] <SOURCE_DIR>
 

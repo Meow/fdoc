@@ -73,7 +73,7 @@ fn layout(project: &Project, path: &str, title: &str, active: Active, body: &str
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="generator" content="fdoc">
-<title>{title} — {label}</title>
+<title>{title} - {label}</title>
 <link rel="stylesheet" href="{root}assets/style.css">
 <script>try{{var t=localStorage.getItem('fdoc-theme');if(t)document.documentElement.setAttribute('data-theme',t)}}catch(e){{}}</script>
 </head>
