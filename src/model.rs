@@ -192,6 +192,10 @@ pub struct Function {
     /// For functions in the `Hooks` category: the reference key (`hook:Name`)
     /// of the hook of that name the project runs, if any.
     pub implements: Option<String>,
+    /// For functions on a part of a per-file template object (see
+    /// `template_part`), such as a command's subcommand: the part's name,
+    /// which `owner` starts with.
+    pub part: Option<String>,
 }
 
 impl Function {
@@ -203,8 +207,15 @@ impl Function {
         }
     }
 
+    /// The name as it is listed on its module's page: qualified for a
+    /// function on a part of the module's object (`add:on_run`), else the
+    /// plain name.
+    pub fn label(&self) -> String {
+        if self.part.is_some() { self.qualified() } else { self.name.clone() }
+    }
+
     pub fn signature(&self) -> String {
-        format!("{}({})", self.name, self.params.join(", "))
+        format!("{}({})", self.label(), self.params.join(", "))
     }
 
     pub fn qualified_signature(&self) -> String {
@@ -748,6 +759,32 @@ fn local_definition(name: &str, init: &str) -> Option<String> {
     Some(capitalize(word))
 }
 
+/// A part of a per-file template object: a file local created by a call on
+/// the object, such as `local add = CMD:subcommand('add')`. Functions on it
+/// belong to the object's module.
+#[derive(Debug, Clone, PartialEq)]
+struct Part {
+    /// The template object, such as `CMD`.
+    object: String,
+    /// The call's string argument (`add`), else the local's name.
+    name: String,
+    /// The default category of its functions, the plural of the method
+    /// called: `subcommand` -> `Subcommands`, `add_bar` -> `Add bars`.
+    category: String,
+}
+
+/// The part a file local is, if its initialiser is a call on a per-file
+/// template object (`CMD:subcommand('add')`, `CMD.part('x')`).
+fn template_part(local: &str, init: &str) -> Option<Part> {
+    let (path, args) = split_call(init.trim())?;
+    let object = path.split(['.', ':']).next()?;
+    let method = &path[path.rfind(['.', ':'])? + 1..];
+    if !is_per_file_object(object) || !is_whole_call(args) {
+        return None;
+    }
+    Some(Part { object: object.to_string(), name: constructor_name(init).unwrap_or_else(|| local.to_string()), category: capitalize(&plural(method).replace('_', " ")) })
+}
+
 /// True when the descriptions of two doc blocks match, ignoring `@realm`
 /// and `@category`.
 fn same_text(a: &DocBlock, b: &DocBlock) -> bool {
@@ -844,7 +881,8 @@ fn file_has_plugin(scan: &FileScan) -> bool {
 
 /// The modules of a file's object locals, by local index: locals whose
 /// initialiser creates an object (see `is_object_init`) and that functions
-/// are defined on. Objects are named by `@module`, `vgui.Register`, the
+/// are defined on, other than parts of a template object (see
+/// `template_part`). Objects are named by `@module`, `vgui.Register`, the
 /// constructor's string argument, else a template-style local (`PANEL`,
 /// `CLASS_TABLE`) gets an id from the file's library or name
 /// (`cw.currency.Class`) and any other local keeps its own name.
@@ -854,7 +892,7 @@ fn local_objects(path: &str, rel: &str, scan: &FileScan, documented_only: bool) 
         .iter()
         .filter(|f| !documented_only || f.doc.is_some())
         .filter_map(|f| f.local_table)
-        .filter(|&i| is_object_init(&scan.locals[i].init))
+        .filter(|&i| is_object_init(&scan.locals[i].init) && template_part(&scan.locals[i].name, &scan.locals[i].init).is_none())
         .collect();
     let single = used.len() == 1 && scan.libraries.is_empty();
     let mut out = vec![None; scan.locals.len()];
@@ -952,9 +990,9 @@ fn ensure_category(m: &mut Module, name: &str, file_categories: &HashMap<&str, &
 }
 
 /// Adds a declared function, merging it into a realm twin: a function of
-/// the same name defined for another realm.
+/// the same name, on the same part, defined for another realm.
 fn add_function(m: &mut Module, f: Function) {
-    let twin = m.functions.iter().position(|e| e.kind == FunctionKind::Declared && e.name == f.name && e.sep == f.sep && !e.sources.iter().any(|s| s.2 == f.realm));
+    let twin = m.functions.iter().position(|e| e.kind == FunctionKind::Declared && e.name == f.name && e.sep == f.sep && e.part == f.part && !e.sources.iter().any(|s| s.2 == f.realm));
     match twin {
         Some(i) => merge_twin(&mut m.functions[i], f),
         None => m.functions.push(f),
@@ -1070,6 +1108,7 @@ fn build_modules(gb: &GroupBuilder, group_title: &str, documented_only: bool, ca
         let file_categories: HashMap<&str, &Category> = scan.categories.iter().map(|c| (c.name.as_str(), c)).collect();
         let objects = local_objects(path, &rel_path(gb, path), scan, documented_only);
         file_objects.insert(path, objects.iter().flatten().map(|t| t.key.clone()).collect());
+        let parts: Vec<Option<Part>> = scan.locals.iter().map(|l| template_part(&l.name, &l.init)).collect();
 
         let twins = branch_twins(scan, gb.realm(path));
         let others: HashSet<usize> = twins.values().copied().collect();
@@ -1081,10 +1120,17 @@ fn build_modules(gb: &GroupBuilder, group_title: &str, documented_only: bool, ca
             if documented_only && f.doc.is_none() && other.is_none_or(|o| o.doc.is_none()) {
                 continue;
             }
-            let owner = resolve_owner(&f.owner, scan, &gb.plugin_global);
-            let target = match f.local_table.and_then(|i| objects[i].clone()) {
-                Some(t) => t,
-                None => owner_target(gb, group_title, path, scan, f, &owner, &plugin_tables),
+            // A part's functions land on its object's module, owned by the
+            // part's name: `add:on_run` for `local add = CMD:subcommand('add')`.
+            let part = f.local_table.and_then(|i| parts[i].as_ref().map(|p| (p, &scan.locals[i].name)));
+            let owner = match part {
+                Some((p, local)) => format!("{}{}", p.name, f.owner.strip_prefix(local.as_str()).unwrap_or_default()),
+                None => resolve_owner(&f.owner, scan, &gb.plugin_global),
+            };
+            let target = match (part, f.local_table.and_then(|i| objects[i].clone())) {
+                (Some((p, _)), _) => owner_target(gb, group_title, path, scan, f, &p.object, &plugin_tables),
+                (None, Some(t)) => t,
+                (None, None) => owner_target(gb, group_title, path, scan, f, &owner, &plugin_tables),
             };
             let key = target.key.clone();
             let title = target.title.clone();
@@ -1099,7 +1145,7 @@ fn build_modules(gb: &GroupBuilder, group_title: &str, documented_only: bool, ca
                 m.kind = ModuleKind::Class { extends: None };
             }
 
-            let category = f.category.clone().unwrap_or_else(|| match (&m.kind, f.sep) {
+            let category = f.category.clone().or_else(|| part.map(|(p, _)| p.category.clone())).unwrap_or_else(|| match (&m.kind, f.sep) {
                 (ModuleKind::Handlers { .. }, _) if is_hook_name(&f.name) => "Hooks".to_string(),
                 (_, Sep::Colon) => "Methods".to_string(),
                 _ => "Functions".to_string(),
@@ -1133,12 +1179,18 @@ fn build_modules(gb: &GroupBuilder, group_title: &str, documented_only: bool, ca
                     callers: Vec::new(),
                     hook_id: None,
                     implements: None,
+                    part: part.map(|(p, _)| p.name.clone()),
                 },
             );
             if matches!(m.kind, ModuleKind::Handlers { .. }) {
                 file_handler.entry(path).or_insert_with(|| key.clone());
             }
-            declared.insert((path, f.qualified()), (key.clone(), f.sep, f.name.clone()));
+            // A part's function is named under its module: `sh_whitelist.add:on_run`.
+            let named = match part {
+                Some(_) => (key.clone(), Sep::Dot, format!("{owner}{}", &f.qualified()[f.owner.len()..])),
+                None => (key.clone(), f.sep, f.name.clone()),
+            };
+            declared.insert((path, f.qualified()), named);
             let keys = file_modules.entry(path).or_default();
             if !keys.contains(&key) {
                 keys.push(key);
@@ -1183,6 +1235,7 @@ fn build_modules(gb: &GroupBuilder, group_title: &str, documented_only: bool, ca
                     callers: Vec::new(),
                     hook_id: None,
                     implements: None,
+                    part: None,
                 },
             );
         }
@@ -1223,6 +1276,7 @@ fn build_modules(gb: &GroupBuilder, group_title: &str, documented_only: bool, ca
                 callers: Vec::new(),
                 hook_id: add.id.clone(),
                 implements: None,
+                part: None,
             });
         }
     }
@@ -1275,6 +1329,7 @@ fn build_modules(gb: &GroupBuilder, group_title: &str, documented_only: bool, ca
             callers: sites.iter().filter_map(|(p, c)| c.caller.as_ref().map(|caller| format!("{p}\u{0}{caller}"))).collect(),
             hook_id: None,
             implements: None,
+            part: None,
         });
     }
     if !hooks.functions.is_empty() {
@@ -1411,10 +1466,10 @@ fn build_modules(gb: &GroupBuilder, group_title: &str, documented_only: bool, ca
             "Methods" => 2,
             _ => 3,
         });
-        m.functions.sort_by(|a, b| a.name.to_ascii_lowercase().cmp(&b.name.to_ascii_lowercase()).then(a.file.cmp(&b.file)));
+        m.functions.sort_by(|a, b| a.label().to_ascii_lowercase().cmp(&b.label().to_ascii_lowercase()).then(a.file.cmp(&b.file)));
         let mut anchors: HashSet<String> = HashSet::new();
         for f in &mut m.functions {
-            let base = slugify(&f.name);
+            let base = slugify(&f.label());
             let mut anchor = base.clone();
             let mut n = 1;
             while !anchors.insert(anchor.clone()) {
@@ -1492,7 +1547,12 @@ fn build_index(project: &Project) -> HashMap<String, String> {
                         insert(f.name.clone(), &url);
                         continue;
                     }
-                    let owners = [Some(f.owner.clone()), Some(f.owner.replace('.', "::")), Some(m.id.clone()), spaced_title.map(str::to_string)];
+                    // A part's functions are only known through their module:
+                    // `sh_whitelist.add:on_run`.
+                    let owners = match &f.part {
+                        Some(_) => [Some(format!("{}.{}", m.id, f.owner)), spaced_title.map(|t| format!("{t}.{}", f.owner)), None, None],
+                        None => [Some(f.owner.clone()), Some(f.owner.replace('.', "::")), Some(m.id.clone()), spaced_title.map(str::to_string)],
+                    };
                     for owner in owners.iter().flatten().collect::<HashSet<_>>() {
                         for sep in ['#', ':', '.'] {
                             insert(format!("{owner}{sep}{}", f.name), &url);
@@ -1500,7 +1560,7 @@ fn build_index(project: &Project) -> HashMap<String, String> {
                     }
                     // `player_meta#name` style references use the local name.
                     for (alias, target) in META_NAMES {
-                        if target == f.owner {
+                        if target == f.owner && f.part.is_none() {
                             for sep in ['#', ':', '.'] {
                                 insert(format!("{alias}{sep}{}", f.name), &url);
                             }
@@ -2114,6 +2174,89 @@ if c then function split() end else function Other.split() end end",
         assert_eq!((cmd.title.as_str(), cmd.definition.as_deref(), cmd.subtitle.as_deref()), ("AddBots", Some("Command"), Some("Command defined in commands/sh_addbots.lua")));
         let money = module(&modules, "fl_money");
         assert_eq!((money.definition.as_deref(), money.subtitle.as_deref()), (Some("Entity"), Some("Entity defined in entities/entities/fl_money")));
+    }
+
+    #[test]
+    fn recognises_template_parts() {
+        let part = |object: &str, name: &str, category: &str| Some(Part { object: object.to_string(), name: name.to_string(), category: category.to_string() });
+        assert_eq!(template_part("add", "CMD:subcommand('add')"), part("CMD", "add", "Subcommands"));
+        assert_eq!(template_part("list_cmd", "CMD:subcommand('list')"), part("CMD", "list", "Subcommands"));
+        assert_eq!(template_part("x", "CMD.subcommand()"), part("CMD", "x", "Subcommands"), "without a name the part keeps the local's");
+        assert_eq!(template_part("bar", "PANEL:add_bar('#Bar')"), part("PANEL", "bar", "Add bars"), "language keys are not names");
+        for (name, init) in [("add", "Cmd:subcommand('add')"), ("add", "cw.command:New('add')"), ("add", "CMD.subcommands"), ("add", "CMD:subcommand('add') or {}"), ("add", "{}")] {
+            assert_eq!(template_part(name, init), None, "{name} = {init}");
+        }
+    }
+
+    #[test]
+    fn places_template_parts_on_their_object() {
+        let p = project(vec![(
+            "lib/commands/sh_whitelist.lua",
+            "--- Manages whitelists.
+
+CMD.name = 'Whitelist'
+local add = CMD:subcommand('add')
+add.description = 'x'
+--- Whitelists the targets.
+-- @param actor [Player the caller]
+function add:on_run(actor, targets)
+  hook.Run('Whitelisted', actor)
+end
+if SERVER then
+  --- Server help.
+  function add:help() end
+else
+  function add:help() end
+end
+local list_cmd = CMD:subcommand('list')
+--- Lists them.
+function list_cmd:on_run(actor) end
+if CLIENT then
+  function list_cmd:help() end
+  function add:status() end
+end
+if SERVER then
+  function list_cmd:status() end
+end
+function list_cmd.util.format() end
+--- @category [Checks]
+
+--- Checks the caller.
+function list_cmd:check() end
+--- Runs without a subcommand.
+function CMD:on_run(actor) end",
+        )]);
+        let modules = &p.sections[0].groups[0].modules;
+        let ids: Vec<&str> = modules.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, vec!["Hooks", "sh_whitelist"], "parts are no modules of their own");
+        let cmd = module(modules, "sh_whitelist");
+        assert_eq!((cmd.title.as_str(), cmd.definition.as_deref(), cmd.summary().as_str()), ("Whitelist", Some("Command"), "Manages whitelists."));
+        let fns: Vec<(String, &str, &str, Option<&str>, Realm)> = cmd.functions.iter().map(|f| (f.label(), f.category.as_str(), f.anchor.as_str(), f.part.as_deref(), f.realm)).collect();
+        assert_eq!(
+            fns,
+            vec![
+                ("add:help".to_string(), "Subcommands", "add_help", Some("add"), Realm::Shared),
+                ("add:on_run".to_string(), "Subcommands", "add_on_run", Some("add"), Realm::Shared),
+                ("add:status".to_string(), "Subcommands", "add_status", Some("add"), Realm::Client),
+                ("list.util.format".to_string(), "Subcommands", "list.util.format", Some("list"), Realm::Shared),
+                ("list:check".to_string(), "Checks", "list_check", Some("list"), Realm::Shared),
+                ("list:help".to_string(), "Subcommands", "list_help", Some("list"), Realm::Client),
+                ("list:on_run".to_string(), "Subcommands", "list_on_run", Some("list"), Realm::Shared),
+                ("list:status".to_string(), "Subcommands", "list_status", Some("list"), Realm::Server),
+                ("on_run".to_string(), "Checks", "on_run", None, Realm::Shared),
+            ]
+        );
+        let add_help = &cmd.functions[0];
+        assert_eq!((add_help.summary().as_str(), add_help.sources.len()), ("Server help.", 2), "realm twins of one part merge");
+        let on_run = &cmd.functions[1];
+        assert_eq!((on_run.qualified_signature().as_str(), on_run.owner.as_str(), on_run.sep), ("add:on_run(actor, targets)", "add", Sep::Colon));
+
+        assert_eq!(module(modules, "Hooks").functions[0].callers, vec!["sh_whitelist.add:on_run"]);
+        for key in ["sh_whitelist.add:on_run", "sh_whitelist.add#on_run", "sh_whitelist.add.on_run"] {
+            assert_eq!(p.resolve(key).as_deref(), Some("core/sh_whitelist.html#add_on_run"), "{key}");
+        }
+        assert_eq!(p.resolve("add:on_run"), None, "a part is only known through its module");
+        assert_eq!(p.resolve("sh_whitelist:on_run").as_deref(), Some("core/sh_whitelist.html#on_run"));
     }
 
     #[test]

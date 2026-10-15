@@ -156,7 +156,7 @@ fn module_functions_template(m: &Module) -> String {
     for (cat, fns) in m.grouped() {
         let _ = write!(out, "<li class=\"sidebar-category\" data-anchor=\"{}\">{}</li>", esc(&category_anchor(&cat.name)), esc(&cat.name));
         for f in fns {
-            let _ = write!(out, "<li data-realm=\"{}\"><a href=\"#{}\">{}</a></li>", realm_parts(f.realm).0, f.anchor, esc(&f.name));
+            let _ = write!(out, "<li data-realm=\"{}\"><a href=\"#{}\">{}</a></li>", realm_parts(f.realm).0, f.anchor, esc(&f.label()));
         }
     }
     out.push_str("</ul></template>\n");
@@ -982,6 +982,31 @@ end",
         assert!(items.contains("{\"t\":\"AddBots\",\"s\":\"sh_addbots\",\"k\":\"Commands\"},{\"t\":\"Kick\",\"s\":\"sh_kick\",\"k\":\"Commands\"}]"), "{items}");
         let data = page("assets/search_data.js");
         assert!(data.contains("{\"t\":\"AddBots\",\"k\":\"command\""), "{data}");
+    }
+
+    #[test]
+    fn renders_template_parts_on_their_object() {
+        let files = vec![(
+            "plugins/admin/plugin/commands/sh_ban.lua".to_string(),
+            scan("--- Bans players.\n\nCMD.name = 'Ban'\nlocal add = CMD:subcommand('add')\n--- Bans the targets.\n-- @param actor [Player the caller]\nfunction add:on_run(actor, targets) end\nlocal remove = CMD:subcommand('remove')\n--- Lifts a ban.\nfunction remove:on_run(actor, steam_id) end"),
+        )];
+        let layout = Layout::default_for("Test");
+        let meta = HashMap::new();
+        let project = build(placed(&layout, files), BuildOptions { title: Some("Test"), ..BuildOptions::new(&layout, &meta) });
+        let pages = render_all(&project);
+        let page = |path: &str| pages.iter().find(|p| p.path == path).map(|p| p.content.as_str()).unwrap_or_else(|| panic!("no page {path}"));
+        assert!(!pages.iter().any(|p| p.path.ends_with("/add.html") || p.path.ends_with("/remove.html")), "parts get no pages of their own");
+
+        let ban = page("plugins/admin/sh_ban.html");
+        assert!(ban.contains("<h1>Ban <span class=\"badge badge-object badge-definition\">command</span>"), "{ban}");
+        assert!(ban.contains("<p>Bans players.</p>"), "{ban}");
+        assert!(ban.contains("<div class=\"summary-group\"><h3>Subcommands</h3>\n<div class=\"summary-row\"><div class=\"summary-signature\"><a href=\"#add_on_run\">add:on_run(actor, targets)</a>"), "{ban}");
+        assert!(ban.contains("<a href=\"#remove_on_run\">remove:on_run(actor, steam_id)</a>"), "{ban}");
+        assert!(ban.contains("<section class=\"detail\" id=\"add_on_run\">\n<div class=\"detail-header\">\n<h3 class=\"signature\"><span class=\"owner\">add:</span>on_run<span class=\"params\">(actor, targets)</span></h3>"), "{ban}");
+        assert!(ban.contains("<li class=\"sidebar-category\" data-anchor=\"subcommands\">Subcommands</li><li data-realm=\"shared\"><a href=\"#add_on_run\">add:on_run</a></li>"), "{ban}");
+
+        let data = page("assets/search_data.js");
+        assert!(data.contains("{\"t\":\"remove:on_run(actor, steam_id)\",\"k\":\"function\",\"r\":\"plugins/admin/sh_ban.html#remove_on_run\",\"d\":\"Lifts a ban.\",\"g\":\"Ban\""), "{data}");
     }
 
     #[test]

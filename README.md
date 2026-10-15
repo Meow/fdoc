@@ -174,7 +174,12 @@ free functions are listed under `Globals`.
   objects. Template objects that the loader injects (`PANEL`, `TOOL`, `ITEM`,
   `ENT`, ...) get one page per file, and an entity, weapon or effect folder
   (`init.lua`, `cl_init.lua`, `shared.lua`) gets one page named after the
-  folder.
+  folder. A local created by a call on a template object, such as a
+  subcommand (`local add = CMD:subcommand('add')`), is part of that
+  object's page rather than an object of its own: its functions are listed
+  there under the call's string argument (`add:on_run`), in a category
+  named after the method (`Subcommands`), and references name them through
+  the page (`sh_ban.add:on_run`).
 - **Definitions.** Objects that the framework loads from their own file,
   such as commands, items, factions, classes, roles, attributes, conditions,
   entities, weapons, effects, tools, panels, themes and skins, are
