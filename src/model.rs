@@ -5,6 +5,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use crate::doc::{DocBlock, Environment, Realm};
 use crate::layout::{GroupMeta, Layout, Placement};
+use crate::lexer::Syntax;
 use crate::scanner::{path_realm, Category, FileScan, FunctionDecl, Sep};
 
 /// Template objects that the loader injects as globals and redefines per
@@ -35,7 +36,7 @@ const LOCAL_DEFINITIONS: [(&str, &str); 2] = [("COMMAND", "Command"), ("CLASS", 
 
 /// Plural definition labels in the order they are listed in; others follow
 /// alphabetically.
-const DEFINITION_ORDER: [&str; 14] = ["Commands", "Items", "Factions", "Classes", "Roles", "Attributes", "Conditions", "Entities", "Weapons", "Effects", "Tools", "Panels", "Themes", "Skins"];
+const DEFINITION_ORDER: [&str; 15] = ["Commands", "Items", "Factions", "Classes", "Roles", "Attributes", "Conditions", "Entities", "Weapons", "Effects", "Tools", "Panels", "Templates", "Themes", "Skins"];
 
 /// File names of an entity, weapon or effect folder; the files of one folder
 /// form one module.
@@ -75,6 +76,8 @@ pub enum ModuleKind {
     /// A per-file template object such as a `PANEL`, or a file-local object
     /// table; `object` is the name it is written as in the code.
     Object { object: String },
+    /// A Lumen template (`.lumen`), with its documented local functions.
+    Template,
 }
 
 /// True for a per-file template object (`CMD`, `PANEL`, `PACKAGE`, ...).
@@ -121,6 +124,7 @@ impl ModuleKind {
             },
             ModuleKind::Globals => "globals",
             ModuleKind::Object { .. } => "object",
+            ModuleKind::Template => "template",
         }
     }
 }
@@ -226,8 +230,12 @@ pub struct Module {
     pub decl_file: Option<(String, usize)>,
     /// What the module defines when it is a definition rather than code:
     /// a template object or file-local object that the framework loads
-    /// from its own file, such as a `Command` or an `Entity`.
+    /// from its own file, such as a `Command` or an `Entity`, or a Lumen
+    /// `Template`.
     pub definition: Option<String>,
+    /// Where the module runs when its file decides it rather than its
+    /// functions: the realm of a Lumen template.
+    pub realm: Option<Realm>,
 }
 
 impl Module {
@@ -267,6 +275,8 @@ pub struct Group {
     pub modules: Vec<Module>,
     /// Core groups have no index page of their own.
     pub is_core: bool,
+    /// `Server` for a package whose `packagespec.lua` sets `serverside`.
+    pub realm: Option<Realm>,
 }
 
 impl Group {
@@ -331,19 +341,23 @@ pub struct BuildOptions<'a> {
     /// Metadata from `plugin.ini` files, by the group's source directory
     /// (`Placement::source_dir`).
     pub group_meta: &'a HashMap<String, GroupMeta>,
+    /// The directories that hold a `packagespec.lua` (relative to the
+    /// source root, empty for the root), and whether it sets `serverside`.
+    pub packages: Option<&'a HashMap<String, bool>>,
 }
 
 impl<'a> BuildOptions<'a> {
     /// Options with nothing set apart from the layout and group metadata.
     pub fn new(layout: &'a Layout, group_meta: &'a HashMap<String, GroupMeta>) -> BuildOptions<'a> {
-        BuildOptions { title: None, fallback_title: None, version: None, summary: None, description: None, documented_only: false, source_url: None, layout, group_meta }
+        BuildOptions { title: None, fallback_title: None, version: None, summary: None, description: None, documented_only: false, source_url: None, layout, group_meta, packages: None }
     }
 }
 
-/// The last component of a `/` separated path without its `.lua` extension.
+/// The last component of a `/` separated path without its `.lua` or
+/// `.lumen` extension.
 pub fn file_stem(path: &str) -> &str {
     let last = path.rsplit('/').next().unwrap_or(path);
-    last.strip_suffix(".lua").unwrap_or(last)
+    last.strip_suffix(".lua").or_else(|| last.strip_suffix(".lumen")).unwrap_or(last)
 }
 
 /// The file stem without its `sv_`, `cl_` or `sh_` realm prefix.
@@ -378,6 +392,16 @@ struct GroupBuilder {
     /// paths relative to it.
     source_dir: String,
     files: Vec<(String, FileScan)>,
+    /// The default realm of each file, see `file_realm`.
+    realms: HashMap<String, Realm>,
+}
+
+impl GroupBuilder {
+    /// The realm the definitions of a file get when neither `@realm` nor an
+    /// `if SERVER` / `if CLIENT` block decides.
+    fn realm(&self, path: &str) -> Realm {
+        self.realms.get(path).copied().unwrap_or_else(|| path_realm(path))
+    }
 }
 
 /// A scanned source file: its path relative to the source root, the group
@@ -435,7 +459,7 @@ pub fn build(files: Vec<PlacedFile>, opts: BuildOptions) -> Project {
     let mut called: HashSet<String> = HashSet::new();
     for (path, place, scan) in files {
         let (place, spec, g) = groups.entry((place.section, place.family, place.key.clone())).or_insert_with(|| {
-            let g = GroupBuilder { name: None, description: None, author: None, version: None, plugin_global: None, source_dir: place.source_dir.clone(), files: Vec::new() };
+            let g = GroupBuilder { name: None, description: None, author: None, version: None, plugin_global: None, source_dir: place.source_dir.clone(), files: Vec::new(), realms: HashMap::new() };
             (place, GroupMeta::default(), g)
         });
         let plugin_field = |name: &str| scan.fields.iter().find(|(o, f, _)| o == "PLUGIN" && f == name).map(|(_, _, v)| v.clone());
@@ -455,6 +479,7 @@ pub fn build(files: Vec<PlacedFile>, opts: BuildOptions) -> Project {
             *spec = package_meta(&scan);
         }
         called.extend(scan.hook_calls.iter().map(|c| c.name.clone()));
+        g.realms.insert(path.clone(), file_realm(&path, opts.packages));
         g.files.push((path, scan));
     }
 
@@ -491,7 +516,8 @@ pub fn build(files: Vec<PlacedFile>, opts: BuildOptions) -> Project {
             n += 1;
             dir = format!("{}-{n}", place.dir);
         }
-        let group = Group { title: group_title, description: gb.description, author: gb.author, version: gb.version, dir, modules, is_core: place.core };
+        let realm = (!place.core && server_package(&format!("{}/packagespec.lua", place.source_dir), opts.packages)).then_some(Realm::Server);
+        let group = Group { title: group_title, description: gb.description, author: gb.author, version: gb.version, dir, modules, is_core: place.core, realm };
         placed.push((place, group));
     }
     // Core groups first, then by key.
@@ -519,11 +545,39 @@ fn resolve_owner(owner: &str, scan: &FileScan, plugin_global: &Option<String>) -
     owner
 }
 
+/// The realm a file's definitions get when neither `@realm` nor an
+/// `if SERVER` / `if CLIENT` block decides: the one its path implies (see
+/// `path_realm`), except that a file of a server-side package, whose
+/// nearest `packagespec.lua` sets `serverside`, runs on the server unless
+/// its path is client-specific.
+pub fn file_realm(path: &str, packages: Option<&HashMap<String, bool>>) -> Realm {
+    match path_realm(path) {
+        Realm::Shared if server_package(path, packages) => Realm::Server,
+        realm => realm,
+    }
+}
+
+/// True when the `packagespec.lua` in the nearest directory above `path`
+/// that has one sets `serverside`.
+fn server_package(path: &str, packages: Option<&HashMap<String, bool>>) -> bool {
+    let Some(packages) = packages else { return false };
+    let mut dir = path;
+    loop {
+        dir = dir.rfind('/').map_or("", |p| &dir[..p]);
+        if let Some(&serverside) = packages.get(dir) {
+            return serverside;
+        }
+        if dir.is_empty() {
+            return false;
+        }
+    }
+}
+
 /// Realm of a definition: its `@realm` tag, else the enclosing `if SERVER`
-/// / `if CLIENT` block, else the file path.
-fn definition_realm(doc: Option<&DocBlock>, block: Realm, path: &str) -> Realm {
-    doc.and_then(|d| d.realm).unwrap_or_else(|| match block {
-        Realm::Shared => path_realm(path),
+/// / `if CLIENT` block, else the file's default realm (see `file_realm`).
+fn definition_realm(doc: Option<&DocBlock>, block: Realm, default: Realm) -> Realm {
+    doc.and_then(|d| d.realm).unwrap_or(match block {
+        Realm::Shared => default,
         specific => specific,
     })
 }
@@ -929,10 +983,10 @@ fn merge_twin(e: &mut Function, mut f: Function) {
 /// of an `if` statement and again, under the same name and for the same
 /// realm, in one of its `elseif` / `else` arms. Maps the index of the first
 /// arm's declaration to the other's.
-fn branch_twins(path: &str, scan: &FileScan) -> HashMap<usize, usize> {
+fn branch_twins(scan: &FileScan, default: Realm) -> HashMap<usize, usize> {
     let mut twins = HashMap::new();
     let mut taken = HashSet::new();
-    let realm = |f: &FunctionDecl| definition_realm(f.doc.as_ref(), f.realm, path);
+    let realm = |f: &FunctionDecl| definition_realm(f.doc.as_ref(), f.realm, default);
     for (i, f) in scan.functions.iter().enumerate() {
         let Some(branch) = f.branch.as_ref().filter(|b| !b.else_branch) else { continue };
         let twin = scan.functions.iter().enumerate().skip(i + 1).find(|(k, g)| {
@@ -1014,7 +1068,7 @@ fn build_modules(gb: &GroupBuilder, group_title: &str, documented_only: bool, ca
         let objects = local_objects(path, &rel_path(gb, path), scan, documented_only);
         file_objects.insert(path, objects.iter().flatten().map(|t| t.key.clone()).collect());
 
-        let twins = branch_twins(path, scan);
+        let twins = branch_twins(scan, gb.realm(path));
         let others: HashSet<usize> = twins.values().copied().collect();
         for (index, f) in scan.functions.iter().enumerate() {
             if others.contains(&index) {
@@ -1049,7 +1103,7 @@ fn build_modules(gb: &GroupBuilder, group_title: &str, documented_only: bool, ca
             });
             ensure_category(m, &category, &file_categories);
 
-            let realm = definition_realm(f.doc.as_ref(), f.realm, path);
+            let realm = definition_realm(f.doc.as_ref(), f.realm, gb.realm(path));
             let mut sources = vec![(path.clone(), f.line, realm)];
             let otherwise = other.map(|o| {
                 sources.push((path.clone(), o.line, realm));
@@ -1089,6 +1143,53 @@ fn build_modules(gb: &GroupBuilder, group_title: &str, documented_only: bool, ca
         }
     }
 
+    // Each Lumen template is a definition of its own, named by its ID (the
+    // file name), described by its file doc and listing its documented
+    // local functions: its components and helpers.
+    for (path, scan) in &gb.files {
+        if Syntax::of_path(path) != Syntax::Lumen {
+            continue;
+        }
+        let doc = scan.file_doc.clone().filter(|d| !is_banner(d));
+        let mut target = Target::new(format!("\u{2}template\u{0}{path}"), file_stem(path).to_string(), ModuleKind::Template);
+        target.subtitle = Some(format!("Lumen template defined in {}", rel_path(gb, path)));
+        target.decl_file = Some((path.clone(), 1));
+        target.definition = Some("Template".to_string());
+        let m = modules.entry(target.key.clone()).or_insert_with(|| target.into_module());
+        m.realm = Some(definition_realm(doc.as_ref(), Realm::Shared, gb.realm(path)));
+        m.doc = doc;
+        m.files.push(path.clone());
+        let file_categories: HashMap<&str, &Category> = scan.categories.iter().map(|c| (c.name.as_str(), c)).collect();
+        for f in scan.local_functions.iter().filter(|f| f.doc.is_some()) {
+            let category = f.category.clone().unwrap_or_else(|| "Functions".to_string());
+            ensure_category(m, &category, &file_categories);
+            let realm = definition_realm(f.doc.as_ref(), f.realm, gb.realm(path));
+            add_function(
+                m,
+                Function {
+                    name: f.name.clone(),
+                    owner: String::new(),
+                    sep: Sep::None,
+                    params: f.params.clone(),
+                    doc: f.doc.clone(),
+                    file: path.clone(),
+                    line: f.line,
+                    anchor: String::new(),
+                    category,
+                    kind: FunctionKind::Declared,
+                    realm,
+                    sources: vec![(path.clone(), f.line, realm)],
+                    doc_realm: realm,
+                    client_doc: None,
+                    otherwise: None,
+                    callers: Vec::new(),
+                    hook_id: None,
+                    implements: None,
+                },
+            );
+        }
+    }
+
     // `hook.Add` handlers go to the file's plugin or gamemode table, else
     // to a `hook.Add` module.
     for (path, scan) in &gb.files {
@@ -1103,7 +1204,7 @@ fn build_modules(gb: &GroupBuilder, group_title: &str, documented_only: bool, ca
                 m.files.push(path.clone());
             }
             ensure_category(m, "Hooks", &HashMap::new());
-            let realm = definition_realm(add.doc.as_ref(), add.realm, path);
+            let realm = definition_realm(add.doc.as_ref(), add.realm, gb.realm(path));
             m.functions.push(Function {
                 name: add.name.clone(),
                 owner: String::new(),
@@ -1147,7 +1248,7 @@ fn build_modules(gb: &GroupBuilder, group_title: &str, documented_only: bool, ca
         if documented_only && doc.is_none() {
             continue;
         }
-        let sources: Vec<(String, usize, Realm)> = sites.iter().map(|(p, c)| (p.to_string(), c.line, definition_realm(c.doc.as_ref(), c.realm, p))).collect();
+        let sources: Vec<(String, usize, Realm)> = sites.iter().map(|(p, c)| (p.to_string(), c.line, definition_realm(c.doc.as_ref(), c.realm, gb.realm(p)))).collect();
         let realm = if sources.iter().all(|s| s.2 == sources[0].2) { sources[0].2 } else { Realm::Shared };
         let widest = sites.iter().fold(sites[0].1, |best, (_, c)| if c.args.len() > best.args.len() { *c } else { best });
         let (file, primary) = documented.copied().unwrap_or(sites[0]);
@@ -1185,10 +1286,10 @@ fn build_modules(gb: &GroupBuilder, group_title: &str, documented_only: bool, ca
     // module of their library, else their only object or module. Without
     // `@module`, a server or client file documents only a module all of
     // whose functions it defines. Files named `sh_` win, then the first
-    // file.
+    // file. A template's file doc documents the template.
     let mut file_docs: HashMap<String, ((bool, usize), &DocBlock)> = HashMap::new();
     for (order, (path, scan)) in gb.files.iter().enumerate() {
-        let Some(doc) = scan.file_doc.as_ref().filter(|d| !is_banner(d)) else { continue };
+        let Some(doc) = scan.file_doc.as_ref().filter(|d| !is_banner(d) && Syntax::of_path(path) == Syntax::Lua) else { continue };
         let by_id = |id: &str| modules.iter().find(|(_, m)| m.id.eq_ignore_ascii_case(id) && m.kind != ModuleKind::Hooks).map(|(k, _)| k.clone());
         let objects = file_objects.get(path.as_str()).map(Vec::as_slice).unwrap_or_default();
         let single_object = (objects.len() == 1 && scan.libraries.is_empty()).then(|| objects[0].clone());
@@ -1338,7 +1439,7 @@ fn is_local_caller(caller: &str, locals: Option<&HashSet<&str>>) -> bool {
 }
 
 fn new_module(id: &str, kind: ModuleKind) -> Module {
-    Module { id: id.to_string(), title: id.to_string(), subtitle: None, slug: slugify(id), kind, doc: None, categories: Vec::new(), functions: Vec::new(), files: Vec::new(), decl_file: None, definition: None }
+    Module { id: id.to_string(), title: id.to_string(), subtitle: None, slug: slugify(id), kind, doc: None, categories: Vec::new(), functions: Vec::new(), files: Vec::new(), decl_file: None, definition: None, realm: None }
 }
 
 fn build_index(project: &Project) -> HashMap<String, String> {
@@ -1379,6 +1480,14 @@ fn build_index(project: &Project) -> HashMap<String, String> {
                             continue;
                         }
                         FunctionKind::Declared => {}
+                    }
+                    // A template's local functions are only known through
+                    // the template: `help_commands#Command`.
+                    if m.kind == ModuleKind::Template {
+                        for sep in ['#', ':', '.'] {
+                            insert(format!("{}{sep}{}", m.id, f.name), &url);
+                        }
+                        continue;
                     }
                     if f.owner.is_empty() {
                         insert(f.name.clone(), &url);
@@ -1965,10 +2074,10 @@ if c then function split() end else function Other.split() end end",
     fn reads_plugin_fields() {
         let layout = Layout::default_for("Flux");
         let meta = HashMap::new();
-        let files = vec![("plugins/cl_crosshair.lua".to_string(), scan("local PLUGIN = PLUGIN\nPLUGIN.name = 'Crosshair'\nPLUGIN.author = 'Mr. Meow'\nPLUGIN.description = 'Adds a crosshair.'\nfunction PLUGIN:HUDPaint() end\nhook.Add('Think', 'x', function() end)"))];
+        let files = vec![("plugins/cl_crosshair.lua".to_string(), scan("local PLUGIN = PLUGIN\nPLUGIN.name = 'Crosshair'\nPLUGIN.author = 'Luna Fox'\nPLUGIN.description = 'Adds a crosshair.'\nfunction PLUGIN:HUDPaint() end\nhook.Add('Think', 'x', function() end)"))];
         let p = build(placed(&layout, files), BuildOptions { title: Some("Flux"), ..BuildOptions::new(&layout, &meta) });
         let group = &p.sections[0].groups[0];
-        assert_eq!((group.title.as_str(), group.author.as_deref(), group.description.as_deref()), ("Crosshair", Some("Mr. Meow"), Some("Adds a crosshair.")));
+        assert_eq!((group.title.as_str(), group.author.as_deref(), group.description.as_deref()), ("Crosshair", Some("Luna Fox"), Some("Adds a crosshair.")));
         let ids: Vec<&str> = group.modules.iter().map(|m| m.id.as_str()).collect();
         assert_eq!(ids, vec!["PLUGIN"], "hook.Add in a plugin file goes to the plugin");
         assert_eq!(group.modules[0].functions[0].realm, Realm::Client);
@@ -2034,5 +2143,112 @@ if c then function split() end else function Other.split() end end",
             ("Blueprints", vec!["chair.Blueprint"]),
             ("Systems", vec!["X"]),
         ]);
+    }
+
+    /// Builds a project from files scanned in the syntax their paths imply,
+    /// with the package directories `packages`.
+    fn project_with(files: Vec<(&str, &str)>, packages: &HashMap<String, bool>) -> Project {
+        let layout = Layout::default_for("Flux");
+        let meta = HashMap::new();
+        let files = files.into_iter().map(|(p, src)| (p.to_string(), crate::scanner::scan_as(src, Syntax::of_path(p)))).collect();
+        build(placed(&layout, files), BuildOptions { title: Some("Flux"), packages: Some(packages), ..BuildOptions::new(&layout, &meta) })
+    }
+
+    fn group<'a>(p: &'a Project, dir: &str) -> &'a Group {
+        p.sections.iter().flat_map(|s| &s.groups).find(|g| g.dir == dir).unwrap_or_else(|| panic!("no group {dir}"))
+    }
+
+    #[test]
+    fn builds_lumen_templates() {
+        let help = "--- The Help tab.
+
+local style = {}
+
+--- One command.
+-- @param props [Map]
+local function Command(props)
+  return <view style={style}>{props.name}</view>
+end
+
+--- Runs on both sides.
+-- @realm shared
+local function both() end
+
+local function helper() end
+
+function Lumen.helper_global() end
+
+return function(props)
+  return <view>{Lumen.map(props.list, function(c) return <Command command={c} /> end)}</view>
+end
+";
+        let p = project_with(
+            vec![
+                ("packages/active_ui/views/lumen/help.lumen", help),
+                ("packages/active_ui/views/lumen/empty.lumen", "return function() return <view/> end"),
+                ("packages/active_ui/lib/sh_help.lua", "--- The help library.\nmod 'Flux::Help'\nfunction Flux.Help:add_page() end"),
+                ("plugins/stats/plugin/views/lumen/character_sheet.lumen", "--- The sheet.\n-- @realm shared\nreturn function() end"),
+                ("views/lumen/core_view.lumen", "--- A core template.\nreturn function() end"),
+            ],
+            &HashMap::new(),
+        );
+        let ui = group(&p, "packages/active_ui");
+        let ids: Vec<&str> = ui.modules.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, vec!["Flux.Help", "help", "Lumen"], "a template without a doc or documented functions is left out");
+        let help = module(&ui.modules, "help");
+        assert_eq!((help.kind.clone(), help.definition.as_deref(), help.badge()), (ModuleKind::Template, Some("Template"), "template".to_string()));
+        assert_eq!((help.title.as_str(), help.summary(), help.subtitle.as_deref()), ("help", "The Help tab.".to_string(), Some("Lumen template defined in views/lumen/help.lumen")));
+        assert_eq!(help.realm, Some(Realm::Client));
+        let functions: Vec<(&str, Realm, &str)> = help.functions.iter().map(|f| (f.name.as_str(), f.realm, f.category.as_str())).collect();
+        assert_eq!(functions, vec![("both", Realm::Shared, "Functions"), ("Command", Realm::Client, "Functions")], "documented local functions only");
+        assert_eq!(help.functions[1].params, vec!["props"]);
+        let global = module(&ui.modules, "Lumen");
+        assert!(global.doc.is_none(), "a template's file doc documents the template");
+        assert_eq!(global.functions[0].realm, Realm::Client);
+        assert_eq!(ui.definitions().into_iter().map(|(label, _)| label).collect::<Vec<_>>(), vec!["Templates"]);
+
+        assert_eq!(p.resolve("help").as_deref(), Some("packages/active_ui/help.html"));
+        assert_eq!(p.resolve("help#Command").as_deref(), Some("packages/active_ui/help.html#Command"));
+        assert_eq!(p.resolve("Command"), None, "local functions are not globals");
+
+        let sheet = module(&group(&p, "plugins/stats").modules, "character_sheet");
+        assert_eq!((sheet.realm, sheet.summary()), (Some(Realm::Shared), "The sheet.".to_string()));
+        let core = module(&group(&p, "core").modules, "core_view");
+        assert_eq!((core.kind.clone(), core.realm), (ModuleKind::Template, Some(Realm::Client)));
+    }
+
+    #[test]
+    fn defaults_server_package_files_to_the_server() {
+        let packages: HashMap<String, bool> = [("", false), ("packages/llm", true), ("packages/llm/vendor/json", false), ("packages/ui", false)].map(|(d, s)| (d.to_string(), s)).into();
+        let p = project_with(
+            vec![
+                ("packages/llm/packagespec.lua", "Package:describe(function(s)\n  s.name = 'LLM'\n  s.serverside = true\nend)"),
+                ("packages/llm/lib/llm.lua", "function llm.new() end\n--- Both.\n-- @realm shared\nfunction llm.both() end\nif CLIENT then\n  function llm.client() end\nend\nif SERVER then\n  function llm.server() end\nend\nhook.Run('LLMReady')\nhook.Add('Think', 'llm', function() end)"),
+                ("packages/llm/lib/sh_twin.lua", "function llm.twin() end"),
+                ("packages/llm/lib/cl_twin.lua", "function llm.twin() end\nfunction llm.cl_only() end"),
+                ("packages/llm/client/menu.lua", "function llm.menu() end"),
+                ("packages/llm/vendor/json/json.lua", "function json.encode() end"),
+                ("packages/ui/lib/ui.lua", "function ui.draw() end"),
+            ],
+            &packages,
+        );
+        let llm = group(&p, "packages/llm");
+        assert_eq!((llm.title.as_str(), llm.realm), ("LLM", Some(Realm::Server)));
+        let realms: Vec<(&str, Realm)> = module(&llm.modules, "llm").functions.iter().map(|f| (f.name.as_str(), f.realm)).collect();
+        assert_eq!(
+            realms,
+            vec![("both", Realm::Shared), ("cl_only", Realm::Client), ("client", Realm::Client), ("menu", Realm::Client), ("new", Realm::Server), ("server", Realm::Server), ("twin", Realm::Shared)]
+        );
+        let twin = module(&llm.modules, "llm").functions.iter().find(|f| f.name == "twin").unwrap();
+        assert_eq!(twin.sources, vec![("packages/llm/lib/sh_twin.lua".to_string(), 1, Realm::Server), ("packages/llm/lib/cl_twin.lua".to_string(), 1, Realm::Client)]);
+        assert_eq!(module(&llm.modules, "json").functions[0].realm, Realm::Shared, "the nearest packagespec decides");
+        assert_eq!(module(&llm.modules, "Hooks").functions[0].realm, Realm::Server);
+        assert_eq!(module(&llm.modules, "hook.Add").functions[0].realm, Realm::Server);
+
+        let ui = group(&p, "packages/ui");
+        assert_eq!((ui.realm, ui.modules[0].functions[0].realm), (None, Realm::Shared));
+        assert_eq!(file_realm("packages/llm/lib/llm.lua", None), Realm::Shared);
+        assert_eq!(file_realm("packages/llm/lib/llm.lua", Some(&packages)), Realm::Server);
+        assert_eq!(file_realm("packages/llm/views/lumen/chat.lumen", Some(&packages)), Realm::Client);
     }
 }

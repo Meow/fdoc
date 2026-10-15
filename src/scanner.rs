@@ -8,7 +8,7 @@ use std::ops::Range;
 
 pub use crate::doc::Realm;
 use crate::doc::{self, DocBlock};
-use crate::lexer::{tokenize, Tok, Token};
+use crate::lexer::{tokenize_as, Syntax, Tok, Token};
 
 /// Calls that run a hook by name: the callee path as written, and how many
 /// arguments sit between the hook name and the hook's own arguments (the
@@ -158,8 +158,14 @@ pub struct FileScan {
     pub vgui_name: Option<String>,
     /// `s.field = 'value'` pairs inside `Package:describe`.
     pub spec: Vec<(String, String)>,
+    /// `s.serverside = true` and `s.clientside = ...` flags inside
+    /// `Package:describe`.
+    pub spec_flags: Vec<(String, bool)>,
     /// Top-level `local NAME = <expr>` declarations, except metatable aliases.
     pub locals: Vec<LocalTable>,
+    /// Top-level `local function` declarations. They are private, except in
+    /// a Lumen template, which lists the documented ones.
+    pub local_functions: Vec<FunctionDecl>,
     /// Every name a `local` statement declares, at any depth: variables
     /// (`local a, b = ...`) and `local function` names.
     pub local_names: BTreeSet<String>,
@@ -233,10 +239,14 @@ struct Scanner {
 }
 
 /// Returns the realm a source path implies (the path is `/` separated and
-/// relative to the source root): `sv_`, `cl_` and `sh_` file name prefixes,
-/// `init.lua`, `cl_init.lua` and `shared.lua`, then the closest directory
-/// named `server`, `client` or `shared`; `Shared` otherwise.
+/// relative to the source root): `Client` for a Lumen template (`.lumen`),
+/// which only runs on the client, else the `sv_`, `cl_` and `sh_` file name
+/// prefixes, `init.lua`, `cl_init.lua` and `shared.lua`, then the closest
+/// directory named `server`, `client` or `shared`; `Shared` otherwise.
 pub fn path_realm(path: &str) -> Realm {
+    if Syntax::of_path(path) == Syntax::Lumen {
+        return Realm::Client;
+    }
     let mut parts = path.split('/').rev();
     let file = parts.next().unwrap_or("").to_ascii_lowercase();
     match file.as_str() {
@@ -273,8 +283,15 @@ fn is_doc_start(t: &Token) -> bool {
     }
 }
 
+#[cfg(test)]
 pub fn scan(src: &str) -> FileScan {
-    let toks = tokenize(src);
+    scan_as(src, Syntax::Lua)
+}
+
+/// Scans source written in `syntax`; the markup of a Lumen template counts
+/// as an expression.
+pub fn scan_as(src: &str, syntax: Syntax) -> FileScan {
+    let toks = tokenize_as(src, syntax);
     let mut s = Scanner { out: FileScan::default(), stack: Vec::new(), category: None, held: None, seen_decl: false };
 
     // Pending doc block: raw comment texts and the line of the last one.
@@ -388,13 +405,21 @@ pub fn scan(src: &str) -> FileScan {
                     if let Some((alias, target)) = parse_meta_alias(&toks, i) {
                         s.out.meta_aliases.push((alias, target));
                     } else if toks.get(i + 1).is_some_and(|n| n.is_name("function")) {
-                        // Local functions are private; skip the name but track the body.
-                        s.take_decl_doc(i);
+                        // Local functions are kept apart from the others;
+                        // the body is tracked either way.
+                        let doc = s.take_decl_doc(i);
                         let name = toks.get(i + 2).and_then(|n| n.name()).map(str::to_string);
-                        s.stack.push(Frame::function(name));
                         if !in_function {
                             s.seen_decl = true;
+                            if let Some(name) = name.clone()
+                                && let Some((params, _)) = parse_params(&toks, i + 3)
+                                && !doc.as_ref().is_some_and(|d| d.ignore)
+                            {
+                                let decl = FunctionDecl { realm: s.realm(), branch: s.branch(), doc, category: s.category.clone(), ..new_decl(String::new(), Sep::None, name, params, t.line) };
+                                s.out.local_functions.push(decl);
+                            }
                         }
+                        s.stack.push(Frame::function(name));
                         i = skip_to_params_end(&toks, i + 2);
                         continue;
                     } else if !in_function && let Some((name, rhs)) = parse_local(&toks, i) {
@@ -935,6 +960,7 @@ fn render(toks: &[Token], range: Range<usize>) -> String {
         let text = match &t.tok {
             Tok::Comment { .. } => continue,
             Tok::Name(s) | Tok::Number(s) | Tok::Sym(s) => s.clone(),
+            Tok::Markup(tag) => format!("<{tag}>"),
             Tok::Str(s) => format!("'{}'", s.replace('\\', "\\\\").replace('\'', "\\'").replace('\n', "\\n")),
         };
         if let Some(p) = prev
@@ -960,7 +986,7 @@ fn render(toks: &[Token], range: Range<usize>) -> String {
 fn ends_operand(t: &Token) -> bool {
     match &t.tok {
         Tok::Name(n) => !is_keyword(n) || matches!(n.as_str(), "end" | "nil" | "true" | "false"),
-        Tok::Str(_) | Tok::Number(_) => true,
+        Tok::Str(_) | Tok::Number(_) | Tok::Markup(_) => true,
         Tok::Sym(s) => matches!(s.as_str(), ")" | "]" | "}" | "..."),
         Tok::Comment { .. } => false,
     }
@@ -982,9 +1008,9 @@ fn space_between(prev: &Token, t: &Token) -> bool {
 }
 
 /// Recognises `PLUGIN:set_x('...')` / `PLUGIN:SetX('...')`,
-/// `vgui.Register('...', PANEL)`, `s.field = '...'` package spec assignments
-/// and top-level `Owner.field = '...'` assignments. Returns the index to
-/// continue from.
+/// `vgui.Register('...', PANEL)`, `s.field = '...'` and `s.flag = true`
+/// package spec assignments and top-level `Owner.field = '...'`
+/// assignments. Returns the index to continue from.
 fn parse_metadata(toks: &[Token], i: usize, out: &mut FileScan, in_function: bool) -> Option<usize> {
     let t = &toks[i];
     let name = t.name()?;
@@ -1034,6 +1060,19 @@ fn parse_metadata(toks: &[Token], i: usize, out: &mut FileScan, in_function: boo
     }
     if !toks.get(j)?.is_sym("=") {
         return None;
+    }
+    // `s.serverside = true` inside `Package:describe(function(s) ... end)`.
+    if parts.len() == 2 && matches!(parts[1], "serverside" | "clientside") {
+        let flag = match toks.get(j + 1)?.name()? {
+            "true" => true,
+            "false" => false,
+            _ => return None,
+        };
+        if toks.get(j + 2).is_some_and(|t| matches!(&t.tok, Tok::Sym(s) if s != ";")) {
+            return None;
+        }
+        out.spec_flags.push((parts[1].to_string(), flag));
+        return Some(j + 2);
     }
     let value = toks.get(j + 1)?.string()?;
     if toks.get(j + 2).is_some_and(|t| matches!(&t.tok, Tok::Sym(s) if s != ";")) {
@@ -1124,6 +1163,8 @@ mod tests {
         assert_eq!(path_realm("server/cl_x.lua"), Realm::Client);
         assert_eq!(path_realm("lib/pipeline.lua"), Realm::Shared);
         assert_eq!(path_realm("server.lua"), Realm::Shared);
+        assert_eq!(path_realm("packages/ui/views/lumen/help.lumen"), Realm::Client);
+        assert_eq!(path_realm("server/views/lumen/sv_help.lumen"), Realm::Client, "templates only run on the client");
     }
 
     #[test]
@@ -1425,5 +1466,68 @@ function ENT:Use() self.name = 'x' end
         assert_eq!(fields, vec![("ENT", "Type", "anim"), ("ENT", "PrintName", "Item"), ("SWEP.Primary", "Ammo", "none")]);
         assert!(scan.spec.is_empty());
         assert_eq!(scan.functions[0].name, "Use");
+    }
+
+    #[test]
+    fn scans_lumen_templates() {
+        let scan = scan_as(
+            "--- The Help tab.
+-- Lists the pages.
+
+local card_style = { padding = 8 }
+
+--- One command.
+-- @param props [Map command]
+local function Command(props)
+  return <view style={card_style} title=\"end of 'it\">
+    -- not a comment, and not the end
+    <text>{props.name}</text>
+    {props.syntax != '' and <text>{props.syntax}</text>}
+  </view>
+end
+
+local function helper() end
+
+return function(props)
+  return <view>
+    {Lumen.map(props.list, function(item)
+      return <Command key={item.id} on_press={function() hook.Run('HelpPressed', item) end} />
+    end)}
+  </view>
+end
+
+function Foo.after() end
+",
+            Syntax::Lumen,
+        );
+        assert_eq!(scan.file_doc.as_ref().unwrap().summary(), "The Help tab.");
+        let locals: Vec<(&str, Option<String>, usize)> = scan.local_functions.iter().map(|f| (f.name.as_str(), f.doc.as_ref().map(|d| d.summary()), f.line)).collect();
+        assert_eq!(locals, vec![("Command", Some("One command.".to_string()), 8), ("helper", None, 16)]);
+        assert_eq!(scan.local_functions[0].params, vec!["props"]);
+        let functions: Vec<String> = scan.functions.iter().map(|f| f.qualified()).collect();
+        assert_eq!(functions, vec!["Foo.after"], "the block structure stays balanced through the markup");
+        assert_eq!((scan.hook_calls[0].name.as_str(), scan.hook_calls[0].line), ("HelpPressed", 21));
+        let locals: Vec<&str> = scan.locals.iter().map(|l| l.name.as_str()).collect();
+        assert_eq!(locals, vec!["card_style"]);
+        assert!(scan.fields.is_empty() && scan.libraries.is_empty() && scan.classes.is_empty());
+    }
+
+    #[test]
+    fn records_local_functions() {
+        let scan = scan("--- Documented.\nlocal function a(x, ...) local function inner() end end\nlocal function b() end\n--- @ignore\nlocal function c() end\nif CLIENT then\n  local function d() end\nend\nfunction e() local function f() end end\n");
+        let names: Vec<(&str, Realm)> = scan.local_functions.iter().map(|f| (f.name.as_str(), f.realm)).collect();
+        assert_eq!(names, vec![("a", Realm::Shared), ("b", Realm::Shared), ("d", Realm::Client)]);
+        assert_eq!(scan.local_functions[0].params, vec!["x", "..."]);
+        assert_eq!(scan.local_functions[0].doc.as_ref().unwrap().summary(), "Documented.");
+        let functions: Vec<&str> = scan.functions.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(functions, vec!["e"]);
+    }
+
+    #[test]
+    fn reads_spec_flags() {
+        let scan = scan("Package:describe(function(s)\n  s.name       = 'LLM'\n  s.serverside = true\n  s.clientside = false;\n  s.verbose    = true\nend)\nENT.Spawnable = false\n");
+        assert_eq!(scan.spec, vec![("name".to_string(), "LLM".to_string())]);
+        assert_eq!(scan.spec_flags, vec![("serverside".to_string(), true), ("clientside".to_string(), false)]);
+        assert!(super::scan("s.serverside = is_server\n").spec_flags.is_empty(), "only literal flags count");
     }
 }

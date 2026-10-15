@@ -201,4 +201,10 @@ mod tests {
         );
         assert_eq!(inline("a < b & snake_case_name", &none), "a &lt; b &amp; snake_case_name");
     }
+
+    #[test]
+    fn leaves_lumen_markup_plain() {
+        let html = highlight_lua("return <view style={{ gap = 4 }}>Hi, {name}!</view>");
+        assert_eq!(html, "<span class=\"hl-k\">return</span> &lt;view style={{ gap = <span class=\"hl-n\">4</span> }}&gt;Hi, {name}!&lt;/view&gt;");
+    }
 }

@@ -3,6 +3,8 @@
 //!
 //! The tokenizer only needs to be precise enough to find declarations and
 //! the comments attached to them, so it does not validate the source.
+//! Lumen templates (`.lumen`) are tokenized with their markup skipped and
+//! the Lua code inside it kept.
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Tok {
@@ -16,6 +18,9 @@ pub enum Tok {
     Comment { text: String, long: bool },
     /// Punctuation / operator.
     Sym(String),
+    /// An element of a Lumen template, by its tag name (empty for a
+    /// fragment). The tokens of the Lua code in its splices follow it.
+    Markup(String),
 }
 
 #[derive(Debug, Clone)]
@@ -51,55 +56,122 @@ impl Token {
     }
 }
 
-pub fn tokenize(src: &str) -> Vec<Token> {
-    let b = src.as_bytes();
-    let mut out = Vec::new();
-    let mut i = 0;
-    let mut line = 1;
-    let mut line_start = true;
+/// The language a source file is written in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Syntax {
+    Lua,
+    /// A Lumen template: Lua in which markup such as
+    /// `<view style={s}>Hi, {name}</view>` may stand wherever an expression
+    /// may.
+    Lumen,
+}
 
-    while i < b.len() {
+impl Syntax {
+    /// `Lumen` for a `.lumen` file, `Lua` for anything else.
+    pub fn of_path(path: &str) -> Syntax {
+        if path.ends_with(".lumen") { Syntax::Lumen } else { Syntax::Lua }
+    }
+}
+
+/// Tokenizes source written in `syntax`. In a Lumen template each element
+/// is one `Tok::Markup` token, followed by the tokens of the Lua code in its
+/// `{ }` splices (attribute values, `{...spread}` and child expressions) in
+/// source order. Tag and attribute names, quoted attribute values, text and
+/// `<!-- -->` comments produce no tokens.
+pub fn tokenize_as(src: &str, syntax: Syntax) -> Vec<Token> {
+    let mut lexer = Lexer { src, b: src.as_bytes(), i: 0, line: 1, line_start: true, lumen: syntax == Syntax::Lumen, out: Vec::new() };
+    lexer.lua(false);
+    lexer.out
+}
+
+struct Lexer<'a> {
+    src: &'a str,
+    b: &'a [u8],
+    i: usize,
+    line: usize,
+    /// Only whitespace precedes the current position on its line.
+    line_start: bool,
+    lumen: bool,
+    out: Vec<Token>,
+}
+
+impl Lexer<'_> {
+    /// Lexes Lua code up to the end of the source or, for a splice, up to
+    /// the `}` that closes it, which is skipped. In a Lumen template a `<`
+    /// starts markup when a name or `>` follows it and the token before it
+    /// cannot end an operand, as in the Lumen compiler: `a < b` stays a
+    /// comparison, `return <view/>` is markup.
+    fn lua(&mut self, splice: bool) {
+        let mut operand = false;
+        let mut depth = 0usize;
+        while let Some(&c) = self.b.get(self.i) {
+            // Whitespace.
+            if c == b'\n' {
+                self.line += 1;
+                self.line_start = true;
+                self.i += 1;
+                continue;
+            }
+            if c.is_ascii_whitespace() {
+                self.i += 1;
+                continue;
+            }
+
+            if self.lumen && c == b'<' && !operand && self.peek(1).is_some_and(|n| n == b'>' || is_name_start(n)) {
+                self.element();
+                operand = true;
+                continue;
+            }
+            if splice && c == b'}' && depth == 0 {
+                self.skip(1);
+                return;
+            }
+
+            let line = self.line;
+            let line_start = self.line_start;
+            self.line_start = false;
+            let tok = self.token();
+            match &tok {
+                Tok::Comment { .. } => {}
+                Tok::Sym(s) if s == "{" => {
+                    depth += 1;
+                    operand = false;
+                }
+                Tok::Sym(s) if s == "}" => {
+                    depth = depth.saturating_sub(1);
+                    operand = true;
+                }
+                tok => operand = ends_operand(tok),
+            }
+            self.out.push(Token { tok, line, line_start });
+        }
+    }
+
+    /// Reads the token that starts at the current position, which is not
+    /// whitespace, and moves past it.
+    fn token(&mut self) -> Tok {
+        let b = self.b;
+        let i = self.i;
         let c = b[i];
-
-        // Whitespace.
-        if c == b'\n' {
-            line += 1;
-            line_start = true;
-            i += 1;
-            continue;
-        }
-        if c.is_ascii_whitespace() {
-            i += 1;
-            continue;
-        }
-
-        let start_line = line;
-        let at_line_start = line_start;
-        line_start = false;
 
         // Comments: `--`, `--[[ ]]`, `//`, `/* */`.
         if c == b'-' && b.get(i + 1) == Some(&b'-') {
-            i += 2;
+            let i = i + 2;
             if let Some(level) = long_bracket_level(b, i) {
                 let open_len = level + 2;
                 let (text, end, nl) = read_long(b, i + open_len, level);
-                line += nl;
-                out.push(Token { tok: Tok::Comment { text, long: true }, line: start_line, line_start: at_line_start });
-                i = end;
-            } else {
-                let end = line_end(b, i);
-                let text = String::from_utf8_lossy(&b[i..end]).into_owned();
-                out.push(Token { tok: Tok::Comment { text, long: false }, line: start_line, line_start: at_line_start });
-                i = end;
+                self.line += nl;
+                self.i = end;
+                return Tok::Comment { text, long: true };
             }
-            continue;
+            let end = line_end(b, i);
+            self.i = end;
+            return Tok::Comment { text: String::from_utf8_lossy(&b[i..end]).into_owned(), long: false };
         }
         if c == b'/' && b.get(i + 1) == Some(&b'/') {
             let end = line_end(b, i + 2);
-            let text = String::from_utf8_lossy(&b[i + 2..end]).into_owned();
-            out.push(Token { tok: Tok::Comment { text, long: false }, line: start_line, line_start: at_line_start });
-            i = end;
-            continue;
+            self.i = end;
+            return Tok::Comment { text: String::from_utf8_lossy(&b[i + 2..end]).into_owned(), long: false };
         }
         if c == b'/' && b.get(i + 1) == Some(&b'*') {
             let mut j = i + 2;
@@ -111,10 +183,9 @@ pub fn tokenize(src: &str) -> Vec<Token> {
                 j += 1;
             }
             let text = String::from_utf8_lossy(&b[i + 2..j.min(b.len())]).into_owned();
-            out.push(Token { tok: Tok::Comment { text, long: true }, line: start_line, line_start: at_line_start });
-            line += nl;
-            i = (j + 2).min(b.len());
-            continue;
+            self.line += nl;
+            self.i = (j + 2).min(b.len());
+            return Tok::Comment { text, long: true };
         }
 
         // Strings.
@@ -128,7 +199,7 @@ pub fn tokenize(src: &str) -> Vec<Token> {
                         b't' => s.push(b'\t'),
                         b'\n' => {
                             s.push(b'\n');
-                            line += 1;
+                            self.line += 1;
                         }
                         other => s.push(other),
                     }
@@ -142,17 +213,15 @@ pub fn tokenize(src: &str) -> Vec<Token> {
                 s.push(b[j]);
                 j += 1;
             }
-            out.push(Token { tok: Tok::Str(String::from_utf8_lossy(&s).into_owned()), line: start_line, line_start: at_line_start });
-            i = (j + 1).min(b.len());
-            continue;
+            self.i = (j + 1).min(b.len());
+            return Tok::Str(String::from_utf8_lossy(&s).into_owned());
         }
         if let (b'[', Some(level)) = (c, long_bracket_level(b, i)) {
             let open_len = level + 2;
             let (text, end, nl) = read_long(b, i + open_len, level);
-            line += nl;
-            out.push(Token { tok: Tok::Str(text), line: start_line, line_start: at_line_start });
-            i = end;
-            continue;
+            self.line += nl;
+            self.i = end;
+            return Tok::Str(text);
         }
 
         // Numbers.
@@ -161,9 +230,8 @@ pub fn tokenize(src: &str) -> Vec<Token> {
             while j < b.len() && (b[j].is_ascii_alphanumeric() || b[j] == b'.' || ((b[j] == b'-' || b[j] == b'+') && matches!(b[j - 1], b'e' | b'E' | b'p' | b'P'))) {
                 j += 1;
             }
-            out.push(Token { tok: Tok::Number(src[i..j].to_string()), line: start_line, line_start: at_line_start });
-            i = j;
-            continue;
+            self.i = j;
+            return Tok::Number(self.src[i..j].to_string());
         }
 
         // Names and keywords.
@@ -172,33 +240,162 @@ pub fn tokenize(src: &str) -> Vec<Token> {
             while j < b.len() && (b[j].is_ascii_alphanumeric() || b[j] == b'_') {
                 j += 1;
             }
-            out.push(Token { tok: Tok::Name(String::from_utf8_lossy(&b[i..j]).into_owned()), line: start_line, line_start: at_line_start });
-            i = j;
-            continue;
+            self.i = j;
+            return Tok::Name(String::from_utf8_lossy(&b[i..j]).into_owned());
         }
 
         // Symbols, longest match first.
         const SYMS: [&str; 15] = ["...", "..", "==", "~=", "!=", "<=", ">=", "&&", "||", "::", "<<", ">>", "//", "=>", "->"];
-        let rest = &src[i..];
-        let mut matched = None;
-        for s in SYMS {
-            if rest.starts_with(s) {
-                matched = Some(s);
-                break;
-            }
-        }
-        let sym = match matched {
+        let rest = &self.src[i..];
+        let sym = match SYMS.into_iter().find(|s| rest.starts_with(s)) {
             Some(s) => s.to_string(),
-            None => {
-                let ch = rest.chars().next().unwrap();
-                ch.to_string()
-            }
+            None => rest.chars().next().unwrap().to_string(),
         };
-        i += sym.len();
-        out.push(Token { tok: Tok::Sym(sym), line: start_line, line_start: at_line_start });
+        self.i += sym.len();
+        Tok::Sym(sym)
     }
 
-    out
+    /// Skips the Lumen element whose `<` is at the current position, with
+    /// its attributes and children, after emitting its `Tok::Markup` token.
+    /// The Lua code of its splices is lexed as it comes. Malformed markup is
+    /// skipped as far as it goes.
+    fn element(&mut self) {
+        let (line, line_start) = (self.line, self.line_start);
+        self.skip(1);
+        let tag = if self.peek(0) == Some(b'>') {
+            self.skip(1);
+            None
+        } else {
+            Some(self.markup_name())
+        };
+        self.out.push(Token { tok: Tok::Markup(tag.clone().unwrap_or_default()), line, line_start });
+
+        if tag.is_some() {
+            loop {
+                self.skip_space();
+                match self.peek(0) {
+                    None => return,
+                    Some(b'/') if self.peek(1) == Some(b'>') => {
+                        self.skip(2);
+                        return;
+                    }
+                    Some(b'>') => {
+                        self.skip(1);
+                        break;
+                    }
+                    Some(b'{') => {
+                        let spread = self.b[self.i..].starts_with(b"{...");
+                        self.skip(if spread { 4 } else { 1 });
+                        self.lua(true);
+                    }
+                    Some(c) if is_name_start(c) => {
+                        self.markup_name();
+                        self.skip_space();
+                        if self.peek(0) != Some(b'=') {
+                            continue;
+                        }
+                        self.skip(1);
+                        self.skip_space();
+                        match self.peek(0) {
+                            Some(quote @ (b'"' | b'\'')) => {
+                                let len = self.b[self.i + 1..].iter().position(|&ch| ch == quote).map_or(self.b.len() - self.i, |p| p + 2);
+                                self.skip(len);
+                            }
+                            Some(b'{') => {
+                                self.skip(1);
+                                self.lua(true);
+                            }
+                            _ => {}
+                        }
+                    }
+                    Some(_) => self.skip(1),
+                }
+            }
+        }
+
+        // Children: comments, the closing tag, elements, splices and text.
+        loop {
+            let rest = &self.b[self.i..];
+            if rest.is_empty() {
+                return;
+            }
+            if rest.starts_with(b"<!--") {
+                let len = find(&rest[4..], b"-->").map_or(rest.len(), |p| p + 7);
+                self.skip(len);
+            } else if rest.starts_with(b"</") {
+                let len = rest.iter().position(|&ch| ch == b'>').map_or(rest.len(), |p| p + 1);
+                self.skip(len);
+                return;
+            } else if rest[0] == b'<' && rest.get(1).is_some_and(|&n| n == b'>' || is_name_start(n)) {
+                self.element();
+            } else if rest[0] == b'{' {
+                self.skip(1);
+                self.lua(true);
+            } else {
+                let len = rest[1..].iter().position(|&ch| ch == b'<' || ch == b'{').map_or(rest.len(), |p| p + 1);
+                self.skip(len);
+            }
+        }
+    }
+
+    /// Reads a tag or attribute name of markup (letters, digits, `_`, `.`
+    /// and `-`).
+    fn markup_name(&mut self) -> String {
+        let start = self.i;
+        let len = self.b[start..].iter().position(|&c| !(c.is_ascii_alphanumeric() || matches!(c, b'_' | b'.' | b'-'))).unwrap_or(self.b.len() - start);
+        self.skip(len);
+        self.src[start..start + len].to_string()
+    }
+
+    fn peek(&self, offset: usize) -> Option<u8> {
+        self.b.get(self.i + offset).copied()
+    }
+
+    /// Moves `n` bytes ahead, counting lines.
+    fn skip(&mut self, n: usize) {
+        let end = (self.i + n).min(self.b.len());
+        for &c in &self.b[self.i..end] {
+            if c == b'\n' {
+                self.line += 1;
+                self.line_start = true;
+            } else if !c.is_ascii_whitespace() {
+                self.line_start = false;
+            }
+        }
+        self.i = end;
+    }
+
+    fn skip_space(&mut self) {
+        let len = self.b[self.i..].iter().position(|c| !c.is_ascii_whitespace()).unwrap_or(self.b.len() - self.i);
+        self.skip(len);
+    }
+}
+
+fn is_name_start(c: u8) -> bool {
+    c.is_ascii_alphabetic() || c == b'_'
+}
+
+/// True when a token can end an operand, by the Lumen compiler's rules:
+/// names other than keywords, `end`, `true`, `false` and `nil`, literals,
+/// markup, `)`, `]`, `}` and `...`.
+fn ends_operand(tok: &Tok) -> bool {
+    match tok {
+        Tok::Name(n) => {
+            matches!(n.as_str(), "end" | "true" | "false" | "nil")
+                || !matches!(
+                    n.as_str(),
+                    "and" | "break" | "continue" | "do" | "else" | "elseif" | "for" | "function" | "goto" | "if" | "in" | "local" | "not" | "or" | "repeat" | "return" | "then" | "until" | "while"
+                )
+        }
+        Tok::Str(_) | Tok::Number(_) | Tok::Markup(_) => true,
+        Tok::Sym(s) => matches!(s.as_str(), ")" | "]" | "}" | "..."),
+        Tok::Comment { .. } => false,
+    }
+}
+
+/// The position of `needle` in `haystack`.
+fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack.windows(needle.len()).position(|w| w == needle)
 }
 
 /// If `b[i..]` starts a long bracket (`[`, `[=`, `[==`...), returns its level.
@@ -253,6 +450,10 @@ fn line_end(b: &[u8], mut i: usize) -> usize {
 mod tests {
     use super::*;
 
+    fn tokenize(src: &str) -> Vec<Token> {
+        tokenize_as(src, Syntax::Lua)
+    }
+
     #[test]
     fn tokenizes_comments_and_strings() {
         let toks = tokenize("--- doc\nfunction a.b:c(x, y) return 'q\\'s' end -- trailing\n--[[ long\ncomment ]] x = 1.5e-3");
@@ -279,5 +480,86 @@ mod tests {
         assert!(toks.iter().any(|t| matches!(&t.tok, Tok::Comment { text, long: false } if text == " c-style")));
         assert!(toks.iter().any(|t| matches!(&t.tok, Tok::Comment { text, long: true } if text == " block\n")));
         assert_eq!(toks.last().unwrap().line, 3);
+    }
+
+    fn lumen(src: &str) -> Vec<Token> {
+        tokenize_as(src, Syntax::Lumen)
+    }
+
+    /// The tokens as compact text, comments left out: names, numbers and
+    /// symbols as written, strings quoted, markup as `<tag>`.
+    fn texts(toks: &[Token]) -> Vec<String> {
+        toks.iter()
+            .filter_map(|t| match &t.tok {
+                Tok::Name(s) | Tok::Number(s) | Tok::Sym(s) => Some(s.clone()),
+                Tok::Str(s) => Some(format!("'{s}'")),
+                Tok::Markup(tag) => Some(format!("<{tag}>")),
+                Tok::Comment { .. } => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn skips_lumen_markup_and_lexes_splices() {
+        let toks = lumen(
+            "return <view style={{ gap = 8 }} on_press={function() hide() end} wide label=\"it's {not} -- code\">
+  Text with end, function, 'quotes', \"doubles\", -- dashes and } braces.
+  <!-- a comment with end and <view> -->
+  <text>{name}</text>
+  <Flux.Card {...props} key='a' />
+  <>{#items > 0 and 'some'}</>
+</view>
+function after() end",
+        );
+        assert_eq!(
+            texts(&toks),
+            [
+                "return", "<view>", "{", "gap", "=", "8", "}", "function", "(", ")", "hide", "(", ")", "end", "<text>", "name", "<Flux.Card>", "props", "<>", "#", "items", ">", "0", "and", "'some'", "function",
+                "after", "(", ")", "end"
+            ]
+        );
+        assert!(!toks.iter().any(|t| matches!(t.tok, Tok::Comment { .. })), "`--` in markup is not a comment");
+        let after = toks.iter().find(|t| t.is_name("after")).unwrap();
+        assert_eq!(after.line, 8);
+        assert!(toks.iter().rev().find(|t| t.is_name("function")).is_some_and(|t| t.line == 8 && t.line_start));
+        assert!(toks.iter().find(|t| t.is_name("name")).is_some_and(|t| t.line == 4 && !t.line_start), "a splice after a tag does not start its line");
+    }
+
+    #[test]
+    fn tells_markup_from_comparisons() {
+        let markup = |src: &str| lumen(src).iter().filter(|t| matches!(t.tok, Tok::Markup(_))).count();
+        assert_eq!(markup("if a < b and #list < 3 and f(x)<y and t[1] <z and 'a' < 'b' and 1 <c then end"), 0);
+        assert_eq!(markup("x = a <= b or a << b or a < (b) or a < 1"), 0);
+        assert_eq!(markup("return <view/>"), 1);
+        assert_eq!(markup("f(<view/>, <text/>)"), 2);
+        assert_eq!(markup("x = cond and <view/> or nil"), 1);
+        assert_eq!(markup("local t = { <view/>, a = <>x</> }"), 2);
+        assert_eq!(markup("if done then end <view/>"), 0, "`end` ends an operand");
+        assert_eq!(markup("x = y -- <view>\n<view/>"), 0, "comments do not change the token before");
+        assert_eq!(tokenize("return <view/>")[1].tok, Tok::Sym("<".to_string()), "Lua files have no markup");
+    }
+
+    #[test]
+    fn lexes_markup_nested_in_splices() {
+        let toks = lumen("local x = <view>{Lumen.map(list, function(item)\n  return <Row key={item.id} on_press={function() f('}') end} />\nend)}</view>\nlocal y = 1");
+        assert_eq!(
+            texts(&toks),
+            [
+                "local", "x", "=", "<view>", "Lumen", ".", "map", "(", "list", ",", "function", "(", "item", ")", "return", "<Row>", "item", ".", "id", "function", "(", ")", "f", "(", "'}'", ")", "end", "end", ")",
+                "local", "y", "=", "1"
+            ]
+        );
+        let lines: Vec<usize> = toks.iter().filter(|t| t.is_name("end") || t.is_name("local")).map(|t| t.line).collect();
+        assert_eq!(lines, [1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn counts_lines_through_markup() {
+        let toks = lumen("return <view\n  title='one\ntwo'\n  style={{\n    a = 1\n  }}>\n  text\n  <!--\n  -->\n  {b}\n</view>\nc");
+        let line = |name: &str| toks.iter().find(|t| t.is_name(name)).map(|t| t.line);
+        assert_eq!((line("a"), line("b"), line("c")), (Some(5), Some(10), Some(12)));
+        assert!(toks.iter().find(|t| t.is_name("c")).unwrap().line_start);
+        let unclosed = lumen("return <view a={x}>\ntext");
+        assert_eq!(texts(&unclosed), ["return", "<view>", "x"], "unclosed markup runs to the end");
     }
 }

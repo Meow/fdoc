@@ -1,10 +1,10 @@
 # fdoc
 
 `fdoc` reads the documentation comments of a Lua code base and generates a
-static HTML reference: one page per class, library, hook table or template
-object, with a sidebar, full-text search, cross-reference links, syntax
-highlighted examples and a night mode. The output is plain files and works
-from disk or any static host.
+static HTML reference: one page per class, library, hook table, template
+object or Lumen template, with a sidebar, full-text search, cross-reference
+links, syntax highlighted examples and a night mode. The output is plain
+files and works from disk or any static host.
 
 ## Usage
 
@@ -12,6 +12,9 @@ from disk or any static host.
 cargo build --release
 ./target/release/fdoc path/to/source -o path/to/docs
 ```
+
+It reads every `.lua` file below the source directory, and every Lumen
+template (`.lumen`, see [below](#lumen-templates)).
 
 | Option | Effect |
 | --- | --- |
@@ -118,7 +121,9 @@ A group's title is the first of:
    which also supplies the description, the author and the version (for
    `plugin.ini`: `version`, else `compatibility`);
 3. the `name` in a `packagespec.lua` in the group's directory, which also
-   supplies the summary, the author and the version;
+   supplies the summary, the author and the version (the group of a package
+   that sets `serverside` is marked server-side, see
+   [Realms](#modules));
 4. the name given to `PLUGIN:set_name`, along with `PLUGIN:set_description`
    and `PLUGIN:set_author`;
 5. the directory or file name that `*` matched.
@@ -175,9 +180,9 @@ free functions are listed under `Globals`.
 - **Definitions.** Objects that the framework loads from their own file,
   such as commands, items, factions, classes, roles, attributes, conditions,
   entities, weapons, effects, tools, panels, themes and skins, are
-  definitions rather than code. Every template object but a `PACKAGE`
-  installer is one, labelled after its name (`CMD` is a `Command`, `ENT` an
-  `Entity`, `SWEP` a `Weapon`), and
+  definitions rather than code, and so are Lumen templates. Every template
+  object but a `PACKAGE` installer is one, labelled after its name (`CMD` is
+  a `Command`, `ENT` an `Entity`, `SWEP` a `Weapon`), and
   so is a file-local object named like one (`local PANEL = {}`,
   `local COMMAND = ...`, `local CLASS = ...`) or, failing that, an all-caps
   local created by a constructor call on a library, labelled after the
@@ -186,13 +191,26 @@ free functions are listed under `Globals`.
   sidebar, on a group's index page and on the project index, a group lists
   its code modules first, then its definitions under a heading per kind
   (`Commands`, `Items`, `Entities`, ...). A definition is badged with its
-  label (`command`, `entity`), and its page says where it is defined
-  (`Command defined in commands/sh_kick.lua`).
+  label (`command`, `entity`, `template`), and its page says where it is
+  defined (`Command defined in commands/sh_kick.lua`).
+- **Lumen templates.** Each `.lumen` file gets a page of its own, titled by
+  its template ID (the file name without the extension) and listed under
+  `Templates`. Its file doc comment describes it, and its documented
+  top-level `local function`s, its components and helpers, are listed on it;
+  references name them through the template (`help_commands#Command`).
+  Functions it defines on tables, such as `function Foo.bar()`, land in their
+  modules as usual.
 - **Realms.** Each function is marked server (blue), client (orange) or
   shared (both), from `@realm`, then `if SERVER` / `if CLIENT` blocks, then
-  the file name. The marker is shown in the summary, the details, the
-  sidebar and search results, and next to the title of a module whose
-  functions all run on one side. A function defined once for the server and
+  the file name. Lumen templates run on the client. Every file of a package
+  whose `packagespec.lua` sets `s.serverside = true` (the nearest
+  `packagespec.lua` above the file decides, whatever the layout) runs on the
+  server, except for client-specific files (`cl_` files, `client/`
+  directories, templates); `@realm` tags and `if CLIENT` blocks still take
+  precedence, and the package's index page is marked server-side. The
+  marker is shown in the summary, the details, the sidebar and search
+  results, and next to the title of a module whose functions all run on one
+  side, or of a template. A function defined once for the server and
   once for the client (such as in `sv_kernel.lua` and `cl_kernel.lua`) is
   shown once, as shared, with both definitions; when their doc comments
   differ, both are shown, the client's under "On the client".
@@ -216,15 +234,29 @@ library it declares, else the only module its functions are in. Without
 module's functions are in that file, so the client half of a module does
 not describe the whole. `sh_` files win over the others.
 
-Local functions are private and never documented.
+Local functions are private and never documented, except in Lumen
+templates.
+
+### Lumen templates
+
+A Lumen template is Lua code in which markup may stand wherever an
+expression may, such as `return <view style={style}>Hi, {name}!</view>`.
+Its markup is skipped, while the Lua code in its `{ }` splices (attribute
+values, `{...spread}` and child expressions) is read like any other code,
+so that hooks run from an event handler inside the markup are found. A `<`
+starts markup as it does for the Lumen compiler: when a name or `>` follows
+it and the token before it cannot end an operand, so `a < b` stays a
+comparison. In the default layout, templates in the `views/lumen` folder of
+a package or a plugin belong to that group, and the others to the core.
 
 ## Doc comments
 
 A doc comment starts with `---` and continues on the following `--` lines. It
 documents the declaration that directly follows it: a `function`, a
 `name = function` assignment, a `class 'Name'` declaration, a top-level
-`local NAME = ...` (such as `local PANEL = {}`), or a statement that runs a
-hook (`hook.Run('Name', ...)`) or adds one (`hook.Add('Name', ...)`).
+`local NAME = ...` (such as `local PANEL = {}`), a top-level
+`local function` of a Lumen template, or a statement that runs a hook
+(`hook.Run('Name', ...)`) or adds one (`hook.Add('Name', ...)`).
 
 The first doc comment that is not attached to anything and comes before the
 first declaration of the file documents the file itself; `@module` names the
@@ -263,7 +295,7 @@ Supported tags:
 | `@deprecation_version [version]` | The version the deprecation starts at. |
 | `@alias [Other.name]` | Another name the function is available under. |
 | `@category [Name]` | On its own, starts a named section that groups the functions below it in the same file. The text after it describes the section. |
-| `@realm [server\|client\|shared]` | Where the code runs, overriding the realm derived from the file name (`sv_`, `cl_`, `sh_`, `init.lua`, ...) and from `if SERVER` / `if CLIENT` blocks. |
+| `@realm [server\|client\|shared]` | Where the code runs, overriding the realm derived from the file name (`sv_`, `cl_`, `sh_`, `init.lua`, `.lumen`, ...), from a server-side package and from `if SERVER` / `if CLIENT` blocks. |
 | `@module [Name]` | In the file's doc comment, the module the file documents (`@module [cw.currency]`); above a `local` table, the name of the object it defines. |
 | `@ignore` | Skips the declaration. |
 

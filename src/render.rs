@@ -211,8 +211,12 @@ fn realm_pill(realm: Realm) -> String {
     format!("<span class=\"realm realm-{name}\" title=\"{title}\">{name}</span>")
 }
 
-/// The realm every function of a module runs in, when it is one side only.
+/// The realm a module runs in, when it is one side only: the module's own,
+/// else the one all of its functions run in.
 fn module_realm(m: &Module) -> Option<Realm> {
+    if let Some(realm) = m.realm {
+        return (realm != Realm::Shared).then_some(realm);
+    }
     let first = m.functions.first()?.realm;
     (first != Realm::Shared && m.functions.iter().all(|f| f.realm == first)).then_some(first)
 }
@@ -338,6 +342,9 @@ fn group_index(project: &Project, group: &Group) -> String {
     let _ = write!(body, "<h1>{}", esc(&group.title));
     if let Some(v) = &group.version {
         let _ = write!(body, " <small class=\"version\">v{}</small>", esc(v));
+    }
+    if let Some(realm) = group.realm {
+        let _ = write!(body, " {}", realm_pill(realm));
     }
     body.push_str("</h1>\n");
     if let Some(d) = &group.description {
@@ -975,5 +982,30 @@ end",
         assert!(items.contains("{\"t\":\"AddBots\",\"s\":\"sh_addbots\",\"k\":\"Commands\"},{\"t\":\"Kick\",\"s\":\"sh_kick\",\"k\":\"Commands\"}]"), "{items}");
         let data = page("assets/search_data.js");
         assert!(data.contains("{\"t\":\"AddBots\",\"k\":\"command\""), "{data}");
+    }
+
+    #[test]
+    fn marks_templates_and_server_packages() {
+        let layout = Layout::default_for("Test");
+        let meta = HashMap::new();
+        let packages: HashMap<String, bool> = [("packages/llm".to_string(), true)].into();
+        let files = vec![
+            ("packages/llm/packagespec.lua".to_string(), scan("s.name = 'LLM'\ns.version = '1.0'")),
+            ("packages/llm/lib/llm.lua".to_string(), scan("--- Makes a client.\nfunction llm.new() end")),
+            ("packages/ui/views/lumen/help.lumen".to_string(), crate::scanner::scan_as("--- The Help tab.\nreturn function() return <view/> end", crate::lexer::Syntax::Lumen)),
+        ];
+        let project = build(placed(&layout, files), BuildOptions { title: Some("Test"), packages: Some(&packages), ..BuildOptions::new(&layout, &meta) });
+        let pages = render_all(&project);
+        let page = |path: &str| pages.iter().find(|p| p.path == path).map(|p| p.content.as_str()).unwrap_or_else(|| panic!("no page {path}"));
+
+        let llm = page("packages/llm/index.html");
+        assert!(llm.contains("<h1>LLM <small class=\"version\">v1.0</small> <span class=\"realm realm-server\" title=\"Server-side\">server</span></h1>"), "{llm}");
+        assert!(page("packages/llm/llm.html").contains("<li data-realm=\"server\"><a href=\"#new\">new</a></li>"));
+        assert!(!page("packages/ui/index.html").contains("<h1>ui <span class=\"realm"));
+
+        let help = page("packages/ui/help.html");
+        assert!(help.contains("<h1>help <span class=\"badge badge-object badge-definition\">template</span><span class=\"realm realm-client\" title=\"Client-side\">client</span></h1>"), "{help}");
+        assert!(help.contains("<p>The Help tab.</p>"), "{help}");
+        assert!(page("packages/ui/index.html").contains("<h2>Templates</h2>"));
     }
 }

@@ -502,6 +502,10 @@ mod tests {
         let file = l.classify("plugins/sh_crosshair.lua").unwrap();
         assert_eq!((file.key.as_str(), file.dir.as_str(), file.source_dir.as_str()), ("sh_crosshair", "plugins/sh_crosshair", "plugins/sh_crosshair"));
         assert_eq!(l.classify("plugins/areas/sh_areas.lua").unwrap().source_dir, "plugins/areas");
+        assert_eq!(place(&l, "packages/active_ui/views/lumen/help.lumen"), Some((1, "active_ui".into(), "packages/active_ui".into(), false)));
+        assert_eq!(place(&l, "plugins/stats/plugin/views/lumen/character_sheet.lumen"), Some((2, "stats".into(), "plugins/stats".into(), false)));
+        assert_eq!(place(&l, "views/lumen/menu.lumen"), Some((0, String::new(), "core".into(), true)));
+        assert_eq!(place(&l, "plugins/menu.lumen").map(|p| p.0), Some(0), "a template is not a single-file plugin");
     }
 
     const CATWORK: &str = "

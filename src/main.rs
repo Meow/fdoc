@@ -16,6 +16,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use layout::{Config, GroupMeta, Layout, Placement};
+use lexer::Syntax;
 use model::{BuildOptions, PlacedFile};
 
 const USAGE: &str = "\
@@ -24,7 +25,7 @@ fdoc — HTML documentation generator for Lua doc comments
 Usage: fdoc [OPTIONS] <SOURCE_DIR>
 
 Arguments:
-  <SOURCE_DIR>            Directory to scan recursively for .lua files
+  <SOURCE_DIR>            Directory to scan recursively for .lua and .lumen files
 
 Options:
   -o, --output <DIR>      Output directory (default: <SOURCE_DIR>/docs)
@@ -122,9 +123,9 @@ fn is_excluded(rel: &str, name: &str, is_dir: bool, excludes: &[String]) -> bool
     })
 }
 
-/// Collects the `.lua` files below `root`, sorted, as `/` separated paths
-/// relative to it.
-fn collect_lua_files(root: &Path, excludes: &[String], skip: Option<&Path>) -> Result<Vec<String>, String> {
+/// Collects the source files below `root` (Lua files and Lumen templates),
+/// sorted, as `/` separated paths relative to it.
+fn collect_source_files(root: &Path, excludes: &[String], skip: Option<&Path>) -> Result<Vec<String>, String> {
     let mut files = Vec::new();
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
@@ -140,7 +141,7 @@ fn collect_lua_files(root: &Path, excludes: &[String], skip: Option<&Path>) -> R
                     continue;
                 }
                 stack.push(path);
-            } else if file_type.is_file() && name.ends_with(".lua") && !is_excluded(&rel, &name, false, excludes) {
+            } else if file_type.is_file() && (name.ends_with(".lua") || name.ends_with(".lumen")) && !is_excluded(&rel, &name, false, excludes) {
                 files.push(rel);
             }
         }
@@ -177,6 +178,31 @@ fn read_group_meta(source: &Path, files: &[PlacedFile]) -> Result<HashMap<String
     Ok(meta)
 }
 
+/// Finds the `packagespec.lua` files in the directories that hold the
+/// source files and their ancestors up to the source root, whether or not
+/// the layout or the excludes take them in, and reads whether each sets
+/// `serverside`. Keyed by directory, empty for the root.
+fn read_packages(source: &Path, files: &[PlacedFile]) -> Result<HashMap<String, bool>, String> {
+    let mut packages = HashMap::new();
+    let mut seen: HashSet<&str> = HashSet::new();
+    for (path, _, _) in files {
+        let mut dir = path.as_str();
+        while !dir.is_empty() {
+            dir = dir.rfind('/').map_or("", |p| &dir[..p]);
+            if !seen.insert(dir) {
+                break;
+            }
+            let spec = source.join(dir).join("packagespec.lua");
+            if spec.is_file() {
+                let text = fs::read(&spec).map_err(|e| format!("cannot read {}: {e}", spec.display()))?;
+                let scan = scanner::scan_as(&String::from_utf8_lossy(&text), Syntax::Lua);
+                packages.insert(dir.to_string(), scan.spec_flags.iter().any(|(k, v)| k == "serverside" && *v));
+            }
+        }
+    }
+    Ok(packages)
+}
+
 fn same_path(a: &Path, b: &Path) -> bool {
     match (a.canonicalize(), b.canonicalize()) {
         (Ok(a), Ok(b)) => a == b,
@@ -203,9 +229,9 @@ fn run(args: Args) -> Result<(), String> {
     let documented_only = args.documented_only || config.documented_only.unwrap_or(false);
     let excludes: Vec<String> = args.excludes.iter().chain(&config.exclude).cloned().collect();
 
-    let files = collect_lua_files(source, &excludes, Some(&output))?;
+    let files = collect_source_files(source, &excludes, Some(&output))?;
     if files.is_empty() {
-        return Err(format!("no .lua files found in {}", source.display()));
+        return Err(format!("no .lua or .lumen files found in {}", source.display()));
     }
     // Files outside every group of the layout are not read at all. The
     // built-in layout is titled once the root packagespec is read; the
@@ -215,7 +241,7 @@ fn run(args: Args) -> Result<(), String> {
     let mut layout = config.layout.unwrap_or_else(|| Layout::default_for(""));
     let files: Vec<(String, Placement)> = files.into_iter().filter_map(|f| layout.classify(&f).map(|p| (f, p))).collect();
     if files.is_empty() {
-        return Err(format!("none of the {total} .lua files in {} matches a group of the layout", source.display()));
+        return Err(format!("none of the {total} source files in {} matches a group of the layout", source.display()));
     }
     let skipped = total - files.len();
 
@@ -223,7 +249,7 @@ fn run(args: Args) -> Result<(), String> {
     for (rel, place) in files {
         let path = source.join(&rel);
         let text = fs::read(&path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-        let scan = scanner::scan(&String::from_utf8_lossy(&text));
+        let scan = scanner::scan_as(&String::from_utf8_lossy(&text), Syntax::of_path(&rel));
         scanned.push((rel, place, scan));
     }
     let scanned_count = scanned.len();
@@ -233,6 +259,7 @@ fn run(args: Args) -> Result<(), String> {
         layout = Layout::default_for(&model::project_title(&scanned, title, dir_name.as_deref()));
     }
     let group_meta = read_group_meta(source, &scanned)?;
+    let packages = read_packages(source, &scanned)?;
     let project = model::build(
         scanned,
         BuildOptions {
@@ -243,6 +270,7 @@ fn run(args: Args) -> Result<(), String> {
             description: config.description.as_deref(),
             documented_only,
             source_url,
+            packages: Some(&packages),
             ..BuildOptions::new(&layout, &group_meta)
         },
     );
