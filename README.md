@@ -13,8 +13,8 @@ cargo build --release
 ./target/release/fdoc path/to/source -o path/to/docs
 ```
 
-It reads every `.lua` file below the source directory, and every Lumen
-template (`.lumen`, see [below](#lumen-templates)).
+It reads every `.lua` file and every Lumen template (`.lumen`, see
+[below](#lumen-templates)) below the source directory.
 
 | Option | Effect |
 | --- | --- |
@@ -121,9 +121,7 @@ A group's title is the first of:
    which also supplies the description, the author and the version (for
    `plugin.ini`: `version`, else `compatibility`);
 3. the `name` in a `packagespec.lua` in the group's directory, which also
-   supplies the summary, the author and the version (the group of a package
-   that sets `serverside` is marked server-side, see
-   [Realms](#modules));
+   supplies the summary, the author and the version;
 4. the name given to `PLUGIN:set_name`, along with `PLUGIN:set_description`
    and `PLUGIN:set_author`;
 5. the directory or file name that `*` matched.
@@ -202,18 +200,18 @@ free functions are listed under `Globals`.
   modules as usual.
 - **Realms.** Each function is marked server (blue), client (orange) or
   shared (both), from `@realm`, then `if SERVER` / `if CLIENT` blocks, then
-  the file name. Lumen templates run on the client. Every file of a package
-  whose `packagespec.lua` sets `s.serverside = true` (the nearest
-  `packagespec.lua` above the file decides, whatever the layout) runs on the
-  server, except for client-specific files (`cl_` files, `client/`
-  directories, templates); `@realm` tags and `if CLIENT` blocks still take
-  precedence, and the package's index page is marked server-side. The
-  marker is shown in the summary, the details, the sidebar and search
-  results, and next to the title of a module whose functions all run on one
-  side, or of a template. A function defined once for the server and
-  once for the client (such as in `sv_kernel.lua` and `cl_kernel.lua`) is
-  shown once, as shared, with both definitions; when their doc comments
-  differ, both are shown, the client's under "On the client".
+  the file name; Lumen templates run on the client. In a package whose
+  `packagespec.lua` sets `s.serverside = true`, a file whose path does not
+  make it client-side (`cl_` files, `client/` directories, templates)
+  counts as a server file; the nearest `packagespec.lua` above a file
+  decides, whatever the layout, and the package's index page is marked
+  server-side. The marker is shown in the summary, the details, the sidebar
+  and search results, and next to the title of a module that runs on one
+  side only: a template, or a module whose functions all do. A function
+  defined once for the server and once for the client (such as in
+  `sv_kernel.lua` and `cl_kernel.lua`) is shown once, as shared, with both
+  definitions; when their doc comments differ, both are shown, the
+  client's under "On the client".
 - **Branch twins.** A function defined in the first arm of an `if`
   statement and again in one of its `elseif` / `else` arms, for the same
   realm, such as a real implementation under
@@ -234,8 +232,8 @@ library it declares, else the only module its functions are in. Without
 module's functions are in that file, so the client half of a module does
 not describe the whole. `sh_` files win over the others.
 
-Local functions are private and never documented, except in Lumen
-templates.
+Local functions are private and not documented, except the top-level ones
+of a Lumen template.
 
 ### Lumen templates
 
@@ -246,8 +244,9 @@ values, `{...spread}` and child expressions) is read like any other code,
 so that hooks run from an event handler inside the markup are found. A `<`
 starts markup as it does for the Lumen compiler: when a name or `>` follows
 it and the token before it cannot end an operand, so `a < b` stays a
-comparison. In the default layout, templates in the `views/lumen` folder of
-a package or a plugin belong to that group, and the others to the core.
+comparison. Templates are placed in groups like any other file, so the
+templates of a package or a plugin (in its `views/lumen/` folder) belong to
+it.
 
 ## Doc comments
 

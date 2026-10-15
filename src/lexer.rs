@@ -87,10 +87,12 @@ pub fn tokenize_as(src: &str, syntax: Syntax) -> Vec<Token> {
 struct Lexer<'a> {
     src: &'a str,
     b: &'a [u8],
+    /// The current position in `b`.
     i: usize,
     line: usize,
     /// Only whitespace precedes the current position on its line.
     line_start: bool,
+    /// The source is a Lumen template, so `<` can start markup.
     lumen: bool,
     out: Vec<Token>,
 }
@@ -104,20 +106,10 @@ impl Lexer<'_> {
     fn lua(&mut self, splice: bool) {
         let mut operand = false;
         let mut depth = 0usize;
-        while let Some(&c) = self.b.get(self.i) {
-            // Whitespace.
-            if c == b'\n' {
-                self.line += 1;
-                self.line_start = true;
-                self.i += 1;
-                continue;
-            }
-            if c.is_ascii_whitespace() {
-                self.i += 1;
-                continue;
-            }
-
-            if self.lumen && c == b'<' && !operand && self.peek(1).is_some_and(|n| n == b'>' || is_name_start(n)) {
+        loop {
+            self.skip_space();
+            let Some(c) = self.peek(0) else { return };
+            if self.lumen && !operand && self.at_element() {
                 self.element();
                 operand = true;
                 continue;
@@ -255,6 +247,12 @@ impl Lexer<'_> {
         Tok::Sym(sym)
     }
 
+    /// True when a Lumen element starts at the current position: a `<`
+    /// followed by a name or `>`.
+    fn at_element(&self) -> bool {
+        self.peek(0) == Some(b'<') && self.peek(1).is_some_and(|n| n == b'>' || is_name_start(n))
+    }
+
     /// Skips the Lumen element whose `<` is at the current position, with
     /// its attributes and children, after emitting its `Tok::Markup` token.
     /// The Lua code of its splices is lexed as it comes. Malformed markup is
@@ -262,80 +260,94 @@ impl Lexer<'_> {
     fn element(&mut self) {
         let (line, line_start) = (self.line, self.line_start);
         self.skip(1);
-        let tag = if self.peek(0) == Some(b'>') {
+        let fragment = self.peek(0) == Some(b'>');
+        let tag = if fragment {
             self.skip(1);
-            None
+            String::new()
         } else {
-            Some(self.markup_name())
+            self.markup_name()
         };
-        self.out.push(Token { tok: Tok::Markup(tag.clone().unwrap_or_default()), line, line_start });
+        self.out.push(Token { tok: Tok::Markup(tag), line, line_start });
+        if fragment || self.attributes() {
+            self.children();
+        }
+    }
 
-        if tag.is_some() {
-            loop {
-                self.skip_space();
-                match self.peek(0) {
-                    None => return,
-                    Some(b'/') if self.peek(1) == Some(b'>') => {
-                        self.skip(2);
-                        return;
-                    }
-                    Some(b'>') => {
-                        self.skip(1);
-                        break;
-                    }
-                    Some(b'{') => {
-                        let spread = self.b[self.i..].starts_with(b"{...");
-                        self.skip(if spread { 4 } else { 1 });
-                        self.lua(true);
-                    }
-                    Some(c) if is_name_start(c) => {
-                        self.markup_name();
-                        self.skip_space();
-                        if self.peek(0) != Some(b'=') {
-                            continue;
-                        }
-                        self.skip(1);
-                        self.skip_space();
-                        match self.peek(0) {
-                            Some(quote @ (b'"' | b'\'')) => {
-                                let len = self.b[self.i + 1..].iter().position(|&ch| ch == quote).map_or(self.b.len() - self.i, |p| p + 2);
-                                self.skip(len);
-                            }
-                            Some(b'{') => {
-                                self.skip(1);
-                                self.lua(true);
-                            }
-                            _ => {}
-                        }
-                    }
-                    Some(_) => self.skip(1),
+    /// Skips the attributes of a tag through the `>` that ends it. False
+    /// when no children follow: the tag closes itself (`/>`) or the source
+    /// ends.
+    fn attributes(&mut self) -> bool {
+        loop {
+            self.skip_space();
+            match self.peek(0) {
+                None => return false,
+                Some(b'/') if self.peek(1) == Some(b'>') => {
+                    self.skip(2);
+                    return false;
                 }
+                Some(b'>') => {
+                    self.skip(1);
+                    return true;
+                }
+                Some(b'{') => {
+                    let spread = self.b[self.i..].starts_with(b"{...");
+                    self.splice(if spread { 4 } else { 1 });
+                }
+                Some(c) if is_name_start(c) => {
+                    self.markup_name();
+                    self.skip_space();
+                    if self.peek(0) != Some(b'=') {
+                        continue;
+                    }
+                    self.skip(1);
+                    self.skip_space();
+                    match self.peek(0) {
+                        Some(quote @ (b'"' | b'\'')) => {
+                            let len = self.b[self.i + 1..].iter().position(|&ch| ch == quote).map_or(self.b.len() - self.i, |p| p + 2);
+                            self.skip(len);
+                        }
+                        Some(b'{') => self.splice(1),
+                        _ => {}
+                    }
+                }
+                Some(_) => self.skip(1),
             }
         }
+    }
 
-        // Children: comments, the closing tag, elements, splices and text.
+    /// Skips the children of an element through its closing tag: text,
+    /// `<!-- -->` comments, nested elements and splices.
+    fn children(&mut self) {
+        let b = self.b;
         loop {
-            let rest = &self.b[self.i..];
+            let rest = &b[self.i..];
             if rest.is_empty() {
                 return;
             }
             if rest.starts_with(b"<!--") {
-                let len = find(&rest[4..], b"-->").map_or(rest.len(), |p| p + 7);
+                let len = rest[4..].windows(3).position(|w| w == b"-->").map_or(rest.len(), |p| p + 7);
                 self.skip(len);
             } else if rest.starts_with(b"</") {
                 let len = rest.iter().position(|&ch| ch == b'>').map_or(rest.len(), |p| p + 1);
                 self.skip(len);
                 return;
-            } else if rest[0] == b'<' && rest.get(1).is_some_and(|&n| n == b'>' || is_name_start(n)) {
+            } else if self.at_element() {
                 self.element();
             } else if rest[0] == b'{' {
-                self.skip(1);
-                self.lua(true);
+                self.splice(1);
             } else {
                 let len = rest[1..].iter().position(|&ch| ch == b'<' || ch == b'{').map_or(rest.len(), |p| p + 1);
                 self.skip(len);
             }
         }
+    }
+
+    /// Lexes the Lua code of the splice at the current position, whose
+    /// opening (`{`, or `{...` for a spread) is `open` bytes long, through
+    /// its closing `}`.
+    fn splice(&mut self, open: usize) {
+        self.skip(open);
+        self.lua(true);
     }
 
     /// Reads a tag or attribute name of markup (letters, digits, `_`, `.`
@@ -375,27 +387,25 @@ fn is_name_start(c: u8) -> bool {
     c.is_ascii_alphabetic() || c == b'_'
 }
 
-/// True when a token can end an operand, by the Lumen compiler's rules:
-/// names other than keywords, `end`, `true`, `false` and `nil`, literals,
-/// markup, `)`, `]`, `}` and `...`.
-fn ends_operand(tok: &Tok) -> bool {
+/// True for a Lua keyword, GLua's `continue` included.
+pub fn is_keyword(name: &str) -> bool {
+    matches!(
+        name,
+        "and" | "break" | "continue" | "do" | "else" | "elseif" | "end" | "false" | "for" | "function" | "goto" | "if" | "in" | "local" | "nil" | "not" | "or" | "repeat" | "return" | "then" | "true" | "until" | "while"
+    )
+}
+
+/// True when a token can end an operand: names other than keywords, `end`,
+/// `true`, `false` and `nil`, literals, markup, `)`, `]`, `}` and `...`.
+/// After one, `(` is a call, `-` a subtraction and `<` a comparison rather
+/// than markup, as in the Lumen compiler.
+pub fn ends_operand(tok: &Tok) -> bool {
     match tok {
-        Tok::Name(n) => {
-            matches!(n.as_str(), "end" | "true" | "false" | "nil")
-                || !matches!(
-                    n.as_str(),
-                    "and" | "break" | "continue" | "do" | "else" | "elseif" | "for" | "function" | "goto" | "if" | "in" | "local" | "not" | "or" | "repeat" | "return" | "then" | "until" | "while"
-                )
-        }
+        Tok::Name(n) => !is_keyword(n) || matches!(n.as_str(), "end" | "nil" | "true" | "false"),
         Tok::Str(_) | Tok::Number(_) | Tok::Markup(_) => true,
         Tok::Sym(s) => matches!(s.as_str(), ")" | "]" | "}" | "..."),
         Tok::Comment { .. } => false,
     }
-}
-
-/// The position of `needle` in `haystack`.
-fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack.windows(needle.len()).position(|w| w == needle)
 }
 
 /// If `b[i..]` starts a long bracket (`[`, `[=`, `[==`...), returns its level.

@@ -178,10 +178,10 @@ fn read_group_meta(source: &Path, files: &[PlacedFile]) -> Result<HashMap<String
     Ok(meta)
 }
 
-/// Finds the `packagespec.lua` files in the directories that hold the
-/// source files and their ancestors up to the source root, whether or not
-/// the layout or the excludes take them in, and reads whether each sets
-/// `serverside`. Keyed by directory, empty for the root.
+/// Reads whether each `packagespec.lua` in the directories of the source
+/// files and above them, up to the source root, sets `serverside`, even
+/// where the layout or the excludes leave the spec out. Keyed by directory,
+/// empty for the root.
 fn read_packages(source: &Path, files: &[PlacedFile]) -> Result<HashMap<String, bool>, String> {
     let mut packages = HashMap::new();
     let mut seen: HashSet<&str> = HashSet::new();
@@ -196,7 +196,7 @@ fn read_packages(source: &Path, files: &[PlacedFile]) -> Result<HashMap<String, 
             if spec.is_file() {
                 let text = fs::read(&spec).map_err(|e| format!("cannot read {}: {e}", spec.display()))?;
                 let scan = scanner::scan_as(&String::from_utf8_lossy(&text), Syntax::Lua);
-                packages.insert(dir.to_string(), scan.spec_flags.iter().any(|(k, v)| k == "serverside" && *v));
+                packages.insert(dir.to_string(), scan.serverside);
             }
         }
     }
@@ -233,7 +233,8 @@ fn run(args: Args) -> Result<(), String> {
     if files.is_empty() {
         return Err(format!("no .lua or .lumen files found in {}", source.display()));
     }
-    // Files outside every group of the layout are not read at all. The
+    // Files outside every group of the layout are not scanned, apart from
+    // the `packagespec.lua` files that `read_packages` reads. The
     // built-in layout is titled once the root packagespec is read; the
     // title does not change where files are placed.
     let total = files.len();

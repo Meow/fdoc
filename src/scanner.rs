@@ -8,7 +8,7 @@ use std::ops::Range;
 
 pub use crate::doc::Realm;
 use crate::doc::{self, DocBlock};
-use crate::lexer::{tokenize_as, Syntax, Tok, Token};
+use crate::lexer::{ends_operand, is_keyword, tokenize_as, Syntax, Tok, Token};
 
 /// Calls that run a hook by name: the callee path as written, and how many
 /// arguments sit between the hook name and the hook's own arguments (the
@@ -158,13 +158,12 @@ pub struct FileScan {
     pub vgui_name: Option<String>,
     /// `s.field = 'value'` pairs inside `Package:describe`.
     pub spec: Vec<(String, String)>,
-    /// `s.serverside = true` and `s.clientside = ...` flags inside
-    /// `Package:describe`.
-    pub spec_flags: Vec<(String, bool)>,
+    /// `s.serverside = true` inside `Package:describe`.
+    pub serverside: bool,
     /// Top-level `local NAME = <expr>` declarations, except metatable aliases.
     pub locals: Vec<LocalTable>,
-    /// Top-level `local function` declarations. They are private, except in
-    /// a Lumen template, which lists the documented ones.
+    /// Top-level `local function` declarations, except `@ignore`d ones.
+    /// Only Lumen templates document them.
     pub local_functions: Vec<FunctionDecl>,
     /// Every name a `local` statement declares, at any depth: variables
     /// (`local a, b = ...`) and `local function` names.
@@ -283,6 +282,7 @@ fn is_doc_start(t: &Token) -> bool {
     }
 }
 
+/// Scans Lua source.
 #[cfg(test)]
 pub fn scan(src: &str) -> FileScan {
     scan_as(src, Syntax::Lua)
@@ -405,7 +405,7 @@ pub fn scan_as(src: &str, syntax: Syntax) -> FileScan {
                     if let Some((alias, target)) = parse_meta_alias(&toks, i) {
                         s.out.meta_aliases.push((alias, target));
                     } else if toks.get(i + 1).is_some_and(|n| n.is_name("function")) {
-                        // Local functions are kept apart from the others;
+                        // Top-level ones are recorded in `local_functions`;
                         // the body is tracked either way.
                         let doc = s.take_decl_doc(i);
                         let name = toks.get(i + 2).and_then(|n| n.name()).map(str::to_string);
@@ -731,13 +731,6 @@ fn parse_local(toks: &[Token], i: usize) -> Option<(String, usize)> {
     Some((name.to_string(), i + 3))
 }
 
-fn is_keyword(name: &str) -> bool {
-    matches!(
-        name,
-        "and" | "break" | "continue" | "do" | "else" | "elseif" | "end" | "false" | "for" | "function" | "goto" | "if" | "in" | "local" | "nil" | "not" | "or" | "repeat" | "return" | "then" | "true" | "until" | "while"
-    )
-}
-
 /// How much a token changes the nesting depth: brackets and the keywords
 /// that open (`function`, `if`, `do`, `repeat`) and close (`end`, `until`)
 /// blocks.
@@ -970,7 +963,7 @@ fn render(toks: &[Token], range: Range<usize>) -> String {
             out.push(' ');
         }
         // `-` is unary at the start or after an operator or keyword.
-        unary = t.is_sym("#") || t.is_sym("!") || (t.is_sym("-") && prev.is_none_or(|p| !ends_operand(p)));
+        unary = t.is_sym("#") || t.is_sym("!") || (t.is_sym("-") && prev.is_none_or(|p| !ends_operand(&p.tok)));
         out.push_str(&text);
         prev = Some(t);
         if out.chars().count() > MAX_SOURCE_LEN {
@@ -979,17 +972,6 @@ fn render(toks: &[Token], range: Range<usize>) -> String {
         }
     }
     out
-}
-
-/// True when `t` can end an operand, so that `(` after it is a call and
-/// `-` after it is a subtraction.
-fn ends_operand(t: &Token) -> bool {
-    match &t.tok {
-        Tok::Name(n) => !is_keyword(n) || matches!(n.as_str(), "end" | "nil" | "true" | "false"),
-        Tok::Str(_) | Tok::Number(_) | Tok::Markup(_) => true,
-        Tok::Sym(s) => matches!(s.as_str(), ")" | "]" | "}" | "..."),
-        Tok::Comment { .. } => false,
-    }
 }
 
 fn space_between(prev: &Token, t: &Token) -> bool {
@@ -1002,15 +984,15 @@ fn space_between(prev: &Token, t: &Token) -> bool {
     }
     // A call or index such as `f(x)`, `t[k]` or `function(a)`.
     if sym(t, &["(", "["]) {
-        return !(ends_operand(prev) || prev.is_name("function"));
+        return !(ends_operand(&prev.tok) || prev.is_name("function"));
     }
     true
 }
 
 /// Recognises `PLUGIN:set_x('...')` / `PLUGIN:SetX('...')`,
-/// `vgui.Register('...', PANEL)`, `s.field = '...'` and `s.flag = true`
-/// package spec assignments and top-level `Owner.field = '...'`
-/// assignments. Returns the index to continue from.
+/// `vgui.Register('...', PANEL)`, `s.field = '...'` and
+/// `s.serverside = true` package spec assignments and top-level
+/// `Owner.field = '...'` assignments. Returns the index to continue from.
 fn parse_metadata(toks: &[Token], i: usize, out: &mut FileScan, in_function: bool) -> Option<usize> {
     let t = &toks[i];
     let name = t.name()?;
@@ -1061,23 +1043,20 @@ fn parse_metadata(toks: &[Token], i: usize, out: &mut FileScan, in_function: boo
     if !toks.get(j)?.is_sym("=") {
         return None;
     }
-    // `s.serverside = true` inside `Package:describe(function(s) ... end)`.
-    if parts.len() == 2 && matches!(parts[1], "serverside" | "clientside") {
-        let flag = match toks.get(j + 1)?.name()? {
-            "true" => true,
-            "false" => false,
-            _ => return None,
-        };
-        if toks.get(j + 2).is_some_and(|t| matches!(&t.tok, Tok::Sym(s) if s != ";")) {
-            return None;
-        }
-        out.spec_flags.push((parts[1].to_string(), flag));
-        return Some(j + 2);
-    }
-    let value = toks.get(j + 1)?.string()?;
+    let value = toks.get(j + 1)?;
     if toks.get(j + 2).is_some_and(|t| matches!(&t.tok, Tok::Sym(s) if s != ";")) {
         return None;
     }
+    // `s.serverside = true` inside `Package:describe(function(s) ... end)`.
+    if parts.len() == 2 && parts[1] == "serverside" {
+        match value.name()? {
+            "true" => out.serverside = true,
+            "false" => {}
+            _ => return None,
+        }
+        return Some(j + 2);
+    }
+    let value = value.string()?;
     let field = parts.pop()?;
 
     // `s.name = 'value'` inside `Package:describe(function(s) ... end)`.
@@ -1524,10 +1503,11 @@ function Foo.after() end
     }
 
     #[test]
-    fn reads_spec_flags() {
-        let scan = scan("Package:describe(function(s)\n  s.name       = 'LLM'\n  s.serverside = true\n  s.clientside = false;\n  s.verbose    = true\nend)\nENT.Spawnable = false\n");
+    fn reads_serverside_flag() {
+        let scan = scan("Package:describe(function(s)\n  s.name       = 'LLM'\n  s.serverside = true;\n  s.verbose    = true\nend)\nENT.Spawnable = false\n");
         assert_eq!(scan.spec, vec![("name".to_string(), "LLM".to_string())]);
-        assert_eq!(scan.spec_flags, vec![("serverside".to_string(), true), ("clientside".to_string(), false)]);
-        assert!(super::scan("s.serverside = is_server\n").spec_flags.is_empty(), "only literal flags count");
+        assert!(scan.serverside);
+        assert!(!super::scan("s.serverside = false\n").serverside);
+        assert!(!super::scan("s.serverside = is_server\n").serverside, "only literal flags count");
     }
 }

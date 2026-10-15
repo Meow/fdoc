@@ -233,8 +233,8 @@ pub struct Module {
     /// from its own file, such as a `Command` or an `Entity`, or a Lumen
     /// `Template`.
     pub definition: Option<String>,
-    /// Where the module runs when its file decides it rather than its
-    /// functions: the realm of a Lumen template.
+    /// The realm of a Lumen template, which its file decides rather than
+    /// its functions.
     pub realm: Option<Realm>,
 }
 
@@ -400,7 +400,7 @@ impl GroupBuilder {
     /// The realm the definitions of a file get when neither `@realm` nor an
     /// `if SERVER` / `if CLIENT` block decides.
     fn realm(&self, path: &str) -> Realm {
-        self.realms.get(path).copied().unwrap_or_else(|| path_realm(path))
+        self.realms[path]
     }
 }
 
@@ -516,7 +516,7 @@ pub fn build(files: Vec<PlacedFile>, opts: BuildOptions) -> Project {
             n += 1;
             dir = format!("{}-{n}", place.dir);
         }
-        let realm = (!place.core && server_package(&format!("{}/packagespec.lua", place.source_dir), opts.packages)).then_some(Realm::Server);
+        let realm = (!place.core && server_package(&place.source_dir, opts.packages)).then_some(Realm::Server);
         let group = Group { title: group_title, description: gb.description, author: gb.author, version: gb.version, dir, modules, is_core: place.core, realm };
         placed.push((place, group));
     }
@@ -547,29 +547,32 @@ fn resolve_owner(owner: &str, scan: &FileScan, plugin_global: &Option<String>) -
 
 /// The realm a file's definitions get when neither `@realm` nor an
 /// `if SERVER` / `if CLIENT` block decides: the one its path implies (see
-/// `path_realm`), except that a file of a server-side package, whose
-/// nearest `packagespec.lua` sets `serverside`, runs on the server unless
-/// its path is client-specific.
-pub fn file_realm(path: &str, packages: Option<&HashMap<String, bool>>) -> Realm {
+/// `path_realm`), except that a file of a server-side package runs on the
+/// server unless its path is client-specific.
+fn file_realm(path: &str, packages: Option<&HashMap<String, bool>>) -> Realm {
     match path_realm(path) {
-        Realm::Shared if server_package(path, packages) => Realm::Server,
+        Realm::Shared if server_package(dir_of(path), packages) => Realm::Server,
         realm => realm,
     }
 }
 
-/// True when the `packagespec.lua` in the nearest directory above `path`
-/// that has one sets `serverside`.
-fn server_package(path: &str, packages: Option<&HashMap<String, bool>>) -> bool {
+/// The directory a `/` separated path is in, empty at the root.
+fn dir_of(path: &str) -> &str {
+    path.rfind('/').map_or("", |p| &path[..p])
+}
+
+/// True when the nearest `packagespec.lua` in `dir` or a directory above
+/// it sets `serverside`.
+fn server_package(mut dir: &str, packages: Option<&HashMap<String, bool>>) -> bool {
     let Some(packages) = packages else { return false };
-    let mut dir = path;
     loop {
-        dir = dir.rfind('/').map_or("", |p| &dir[..p]);
         if let Some(&serverside) = packages.get(dir) {
             return serverside;
         }
         if dir.is_empty() {
             return false;
         }
+        dir = dir_of(dir);
     }
 }
 
@@ -1146,26 +1149,21 @@ fn build_modules(gb: &GroupBuilder, group_title: &str, documented_only: bool, ca
     // Each Lumen template is a definition of its own, named by its ID (the
     // file name), described by its file doc and listing its documented
     // local functions: its components and helpers.
-    for (path, scan) in &gb.files {
-        if Syntax::of_path(path) != Syntax::Lumen {
-            continue;
-        }
-        let doc = scan.file_doc.clone().filter(|d| !is_banner(d));
-        let mut target = Target::new(format!("\u{2}template\u{0}{path}"), file_stem(path).to_string(), ModuleKind::Template);
-        target.subtitle = Some(format!("Lumen template defined in {}", rel_path(gb, path)));
-        target.decl_file = Some((path.clone(), 1));
-        target.definition = Some("Template".to_string());
-        let m = modules.entry(target.key.clone()).or_insert_with(|| target.into_module());
-        m.realm = Some(definition_realm(doc.as_ref(), Realm::Shared, gb.realm(path)));
-        m.doc = doc;
+    for (path, scan) in gb.files.iter().filter(|(path, _)| Syntax::of_path(path) == Syntax::Lumen) {
+        let mut m = new_module(file_stem(path), ModuleKind::Template);
+        m.subtitle = Some(format!("Lumen template defined in {}", rel_path(gb, path)));
+        m.decl_file = Some((path.clone(), 1));
+        m.definition = Some("Template".to_string());
+        m.doc = scan.file_doc.clone().filter(|d| !is_banner(d));
+        m.realm = Some(m.doc.as_ref().and_then(|d| d.realm).unwrap_or(gb.realm(path)));
         m.files.push(path.clone());
         let file_categories: HashMap<&str, &Category> = scan.categories.iter().map(|c| (c.name.as_str(), c)).collect();
         for f in scan.local_functions.iter().filter(|f| f.doc.is_some()) {
             let category = f.category.clone().unwrap_or_else(|| "Functions".to_string());
-            ensure_category(m, &category, &file_categories);
+            ensure_category(&mut m, &category, &file_categories);
             let realm = definition_realm(f.doc.as_ref(), f.realm, gb.realm(path));
             add_function(
-                m,
+                &mut m,
                 Function {
                     name: f.name.clone(),
                     owner: String::new(),
@@ -1188,6 +1186,7 @@ fn build_modules(gb: &GroupBuilder, group_title: &str, documented_only: bool, ca
                 },
             );
         }
+        modules.insert(format!("\u{2}template\u{0}{path}"), m);
     }
 
     // `hook.Add` handlers go to the file's plugin or gamemode table, else
