@@ -1,5 +1,5 @@
 //! fdoc - generates HTML documentation from the doc comments of a Lua
-//! code base.
+//! code base, with its Lumen templates and NL files.
 
 mod doc;
 mod html;
@@ -7,6 +7,7 @@ mod layout;
 mod lexer;
 mod markdown;
 mod model;
+mod nl;
 mod render;
 mod scanner;
 
@@ -20,12 +21,12 @@ use lexer::Syntax;
 use model::{BuildOptions, PlacedFile};
 
 const USAGE: &str = "\
-fdoc - HTML documentation generator for Lua doc comments
+fdoc - HTML documentation generator for Lua and NL doc comments
 
 Usage: fdoc [OPTIONS] <SOURCE_DIR>
 
 Arguments:
-  <SOURCE_DIR>            Directory to scan recursively for .lua and .lumen files
+  <SOURCE_DIR>            Directory to scan recursively for .lua, .lumen, .nl and .nlua files
 
 Options:
   -o, --output <DIR>      Output directory (default: <SOURCE_DIR>/docs)
@@ -123,8 +124,14 @@ fn is_excluded(rel: &str, name: &str, is_dir: bool, excludes: &[String]) -> bool
     })
 }
 
-/// Collects the source files below `root` (Lua files and Lumen templates),
-/// sorted, as `/` separated paths relative to it.
+/// True for the name of a file fdoc reads: a Lua file, a Lumen template or
+/// an NL file (`.nl`, `.nlua`), but not an NL declaration file (`.d.nl`).
+fn is_source_file(name: &str) -> bool {
+    [".lua", ".lumen", ".nl", ".nlua"].iter().any(|ext| name.ends_with(ext)) && !name.ends_with(".d.nl")
+}
+
+/// Collects the source files below `root` (Lua files, Lumen templates and
+/// NL files), sorted, as `/` separated paths relative to it.
 fn collect_source_files(root: &Path, excludes: &[String], skip: Option<&Path>) -> Result<Vec<String>, String> {
     let mut files = Vec::new();
     let mut stack = vec![root.to_path_buf()];
@@ -141,7 +148,7 @@ fn collect_source_files(root: &Path, excludes: &[String], skip: Option<&Path>) -
                     continue;
                 }
                 stack.push(path);
-            } else if file_type.is_file() && (name.ends_with(".lua") || name.ends_with(".lumen")) && !is_excluded(&rel, &name, false, excludes) {
+            } else if file_type.is_file() && is_source_file(&name) && !is_excluded(&rel, &name, false, excludes) {
                 files.push(rel);
             }
         }
@@ -231,7 +238,7 @@ fn run(args: Args) -> Result<(), String> {
 
     let files = collect_source_files(source, &excludes, Some(&output))?;
     if files.is_empty() {
-        return Err(format!("no .lua or .lumen files found in {}", source.display()));
+        return Err(format!("no .lua, .lumen, .nl or .nlua files found in {}", source.display()));
     }
     // Files outside every group of the layout are not scanned, apart from
     // the `packagespec.lua` files that `read_packages` reads. The
@@ -250,7 +257,7 @@ fn run(args: Args) -> Result<(), String> {
     for (rel, place) in files {
         let path = source.join(&rel);
         let text = fs::read(&path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-        let scan = scanner::scan_as(&String::from_utf8_lossy(&text), Syntax::of_path(&rel));
+        let scan = scanner::scan_file(&String::from_utf8_lossy(&text), &rel);
         scanned.push((rel, place, scan));
     }
     let scanned_count = scanned.len();
@@ -334,6 +341,15 @@ mod tests {
         assert!(is_excluded("gamemodes/a/lib", "lib", true, &excludes));
         assert!(!is_excluded("gamemodes/b/lib", "lib", true, &excludes));
         assert!(is_excluded("x/skip.lua", "skip.lua", false, &excludes));
+    }
+
+    #[test]
+    fn reads_lua_lumen_and_nl_files() {
+        for name in ["a.lua", "b.lumen", "c.nl", "d.nlua"] {
+            assert!(is_source_file(name), "{name}");
+        }
+        assert!(!is_source_file("glua.d.nl"), "declaration files are not read");
+        assert!(!is_source_file("notes.md"));
     }
 
     #[test]

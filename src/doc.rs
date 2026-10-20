@@ -317,15 +317,22 @@ fn split_type(content: &str) -> (Option<String>, String) {
     }
 }
 
+/// Parses `name[=default] [Type description]`. Without brackets or a
+/// default, the words after the name are its description:
+/// `@param amount The damage`.
 fn parse_param(body: &str) -> Param {
     let (head, content) = split_bracket(body);
+    let (head, unbracketed) = match (&content, head.split_once(char::is_whitespace)) {
+        (None, Some((name, rest))) if !head.contains('=') => (name.to_string(), rest.trim().to_string()),
+        _ => (head, String::new()),
+    };
     let (name, default) = match head.find('=') {
         Some(p) => (head[..p].trim().to_string(), Some(head[p + 1..].trim().to_string())),
         None => (head, None),
     };
     let (ty, description) = match content {
         Some(c) => split_type(&c),
-        None => (None, String::new()),
+        None => (None, unbracketed),
     };
     Param { name, default: default.filter(|d| !d.is_empty()), ty, description }
 }
@@ -557,6 +564,13 @@ mod tests {
 
     fn raw(s: &str) -> Vec<String> {
         s.lines().map(|l| l.trim_start().trim_start_matches("--").to_string()).collect()
+    }
+
+    #[test]
+    fn reads_unbracketed_param_descriptions() {
+        let doc = parse(&raw("--- X.\n-- @param amount The damage dealt\n-- @param n=Some default\n-- @param flag"));
+        let params: Vec<(&str, Option<&str>, &str)> = doc.params.iter().map(|p| (p.name.as_str(), p.default.as_deref(), p.description.as_str())).collect();
+        assert_eq!(params, vec![("amount", None, "The damage dealt"), ("n", Some("Some default"), ""), ("flag", None, "")]);
     }
 
     #[test]

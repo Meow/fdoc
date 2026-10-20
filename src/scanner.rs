@@ -8,7 +8,7 @@ use std::ops::Range;
 
 pub use crate::doc::Realm;
 use crate::doc::{self, DocBlock};
-use crate::lexer::{ends_operand, is_keyword, tokenize_as, Syntax, Tok, Token};
+use crate::lexer::{ends_operand, is_keyword, lua_name, tokenize_as, Syntax, Tok, Token};
 
 /// Calls that run a hook by name: the callee path as written, and how many
 /// arguments sit between the hook name and the hook's own arguments (the
@@ -24,10 +24,10 @@ pub const HOOK_CALLERS: [(&str, usize); 7] = [
 ];
 
 /// Longest source rendering kept for `LocalTable::init` and `HookCall::args`.
-const MAX_SOURCE_LEN: usize = 80;
+pub(crate) const MAX_SOURCE_LEN: usize = 80;
 
 /// Longest source rendering kept for `Branch::condition`.
-const MAX_CONDITION_LEN: usize = 60;
+pub(crate) const MAX_CONDITION_LEN: usize = 60;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Sep {
@@ -70,6 +70,17 @@ pub struct FunctionDecl {
     /// The innermost enclosing `if` statement and the arm the declaration
     /// is in.
     pub branch: Option<Branch>,
+    /// NL only: a value rather than a function, such as a struct field, an
+    /// enum variant, a constant, a global or a type alias. It has no
+    /// parameters.
+    pub value: bool,
+    /// NL only: the declared type as written, the return type of a
+    /// function (`String`) or the type of a value (`Number`).
+    pub ty: Option<String>,
+    /// NL only: what a value is given, as written: the default of a field
+    /// (`100`), the value of a variant or constant, the type a type alias
+    /// stands for.
+    pub init: Option<String>,
 }
 
 impl FunctionDecl {
@@ -89,6 +100,9 @@ pub struct ClassDecl {
     pub extends: Option<String>,
     pub line: usize,
     pub doc: Option<DocBlock>,
+    /// NL only: the keyword that declares it (`struct`, `enum`,
+    /// `interface`, `module`), shown as its badge instead of `class`.
+    pub keyword: Option<&'static str>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -241,13 +255,14 @@ struct Scanner {
 /// relative to the source root): `Client` for a Lumen template (`.lumen`),
 /// which only runs on the client, else the `sv_`, `cl_` and `sh_` file name
 /// prefixes, `init.lua`, `cl_init.lua` and `shared.lua`, then the closest
-/// directory named `server`, `client` or `shared`; `Shared` otherwise.
+/// directory named `server`, `client` or `shared`; `Shared` otherwise. An
+/// NL file counts as the Lua file it stands for (`init.nl` is `init.lua`).
 pub fn path_realm(path: &str) -> Realm {
     if Syntax::of_path(path) == Syntax::Lumen {
         return Realm::Client;
     }
     let mut parts = path.split('/').rev();
-    let file = parts.next().unwrap_or("").to_ascii_lowercase();
+    let file = lua_name(parts.next().unwrap_or("")).to_ascii_lowercase();
     match file.as_str() {
         "init.lua" => return Realm::Server,
         "cl_init.lua" => return Realm::Client,
@@ -288,8 +303,17 @@ pub fn scan(src: &str) -> FileScan {
     scan_as(src, Syntax::Lua)
 }
 
-/// Scans source written in `syntax`; the markup of a Lumen template counts
-/// as an expression.
+/// Scans the source file at `path` (relative to the source root), in the
+/// syntax its extension implies.
+pub fn scan_file(src: &str, path: &str) -> FileScan {
+    match Syntax::of_path(path) {
+        Syntax::Nl => crate::nl::scan(src, path),
+        syntax => scan_as(src, syntax),
+    }
+}
+
+/// Scans Lua source, or a Lumen template, in which markup counts as an
+/// expression. NL source goes through `scan_file`.
 pub fn scan_as(src: &str, syntax: Syntax) -> FileScan {
     let toks = tokenize_as(src, syntax);
     let mut s = Scanner { out: FileScan::default(), stack: Vec::new(), category: None, held: None, seen_decl: false };
@@ -593,8 +617,8 @@ fn parse_function_decl(toks: &[Token], i: usize) -> Option<(FunctionDecl, usize)
     Some((new_decl(owner, sep, name, params, line), next))
 }
 
-fn new_decl(owner: String, sep: Sep, name: String, params: Vec<String>, line: usize) -> FunctionDecl {
-    FunctionDecl { owner, sep, name, params, line, doc: None, category: None, realm: Realm::Shared, local_table: None, branch: None }
+pub(crate) fn new_decl(owner: String, sep: Sep, name: String, params: Vec<String>, line: usize) -> FunctionDecl {
+    FunctionDecl { owner, sep, name, params, line, doc: None, category: None, realm: Realm::Shared, local_table: None, branch: None, value: false, ty: None, init: None }
 }
 
 /// Parses `Name.path = function(...)` / `Name.path = function(...)`.
@@ -674,7 +698,7 @@ fn parse_class_decl(toks: &[Token], i: usize) -> Option<(ClassDecl, usize)> {
             j = k;
         }
     }
-    Some((ClassDecl { name, extends, line, doc: None }, j))
+    Some((ClassDecl { name, extends, line, doc: None, keyword: None }, j))
 }
 
 /// `local x = FindMetaTable('Y')` -> (x, Y); `local x = debug.getmetatable(0)` -> (x, Number).

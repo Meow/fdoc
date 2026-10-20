@@ -323,6 +323,10 @@ th { background: var(--code-background); }
 }
 h1 .badge, h1 .realm, h1 .flag { font-size: 0.75rem; }
 .badge-class { --badge-hue: 262; }
+.badge-struct { --badge-hue: 262; }
+.badge-enum { --badge-hue: 28; }
+.badge-interface { --badge-hue: 210; }
+.badge-module { --badge-hue: 190; }
 .badge-library { --badge-hue: 190; }
 .badge-object { --badge-hue: 320; }
 .badge-hooks { --badge-hue: 140; }

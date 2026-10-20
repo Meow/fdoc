@@ -1,10 +1,11 @@
 # fdoc
 
-`fdoc` reads the documentation comments of a Lua code base and generates a
-static HTML reference: one page per class, library, hook table, template
-object or Lumen template, with a sidebar, full-text search, cross-reference
-links, syntax highlighted examples and a night mode. The output is plain
-files and works from disk or any static host.
+`fdoc` reads the documentation comments of a Lua code base, along with its
+[NL](https://github.com/nl-lang/nl) files, and generates a static HTML
+reference: one page per class, library, hook table, template object, Lumen
+template, NL struct, enum, interface or module, with a sidebar, full-text
+search, cross-reference links, syntax highlighted examples and a night mode.
+The output is plain files and works from disk or any static host.
 
 ## Usage
 
@@ -13,8 +14,10 @@ cargo build --release
 ./target/release/fdoc path/to/source -o path/to/docs
 ```
 
-It reads every `.lua` file and every Lumen template (`.lumen`, see
-[below](#lumen-templates)) below the source directory.
+It reads every `.lua` file, every Lumen template (`.lumen`, see
+[below](#lumen-templates)) and every NL file (`.nl` and `.nlua`, see
+[below](#nl-files)) below the source directory. NL declaration files
+(`.d.nl`) are not read.
 
 | Option | Effect |
 | --- | --- |
@@ -106,12 +109,12 @@ directory or file at that path, relative to the source directory.
 
 A group `path` is relative to the source directory. A `*` component matches
 any directory and makes one group per match; `*.lua` as the last component
-matches any file and makes one group per file. `.` is the whole source tree.
-When a file matches several paths, the one with the most components that are
-not wildcards wins, and `.` loses to all others. Files that match no path are
-left out of the documentation, and their number is reported. A group directory
-and a file of the same name in one section, such as `plugins/stamina/` and
-`plugins/stamina.lua`, form one group.
+matches any Lua or NL file and makes one group per file. `.` is the whole
+source tree. When a file matches several paths, the one with the most
+components that are not wildcards wins, and `.` loses to all others. Files
+that match no path are left out of the documentation, and their number is
+reported. A group directory and a file of the same name in one section, such
+as `plugins/stamina/` and `plugins/stamina.lua`, form one group.
 
 A group's title is the first of:
 
@@ -205,7 +208,9 @@ free functions are listed under `Globals`.
   modules as usual.
 - **Realms.** Each function is marked server (blue), client (orange) or
   shared (both), from `@realm`, then `if SERVER` / `if CLIENT` blocks, then
-  the file name; Lumen templates run on the client. In a package whose
+  the file name; Lumen templates run on the client. An NL file counts as
+  the Lua file it stands for (`init.nl` is `init.lua`, `cl_hud.nl` is a
+  client file). In a package whose
   `packagespec.lua` sets `s.serverside = true`, a file whose path does not
   make it client-side (`cl_` files, `client/` directories, templates)
   counts as a server file; the nearest `packagespec.lua` above a file
@@ -238,7 +243,8 @@ module's functions are in that file, so the client half of a module does
 not describe the whole. `sh_` files win over the others.
 
 Local functions are private and not documented, except the top-level ones
-of a Lumen template.
+of a Lumen template. In NL, top-level functions, constants and types without
+`pub` are private.
 
 ### Lumen templates
 
@@ -253,6 +259,55 @@ comparison. Templates are placed in groups like any other file, so the
 templates of a package or a plugin (in its `views/lumen/` folder) belong to
 it.
 
+### NL files
+
+NL files are read with NL's own parser. An NL file stands for the Lua file
+of the same name, as it does on a server with NL's `lua_shared`: it is
+placed in groups, named, given a realm and made part of an entity folder as
+`x.lua` would be. Its doc comments are `##` lines (see
+[Doc comments](#doc-comments)). What it declares is documented as follows:
+
+- **Exports.** The `pub fn`, `pub const` and `pub type` declarations of a
+  file are the members of a module badged `module` and named by the path
+  NL imports the file by: the path below the last `lua` directory, as in an
+  addon (`addons/inv/lua/inv/sh_items.nl` is `inv/sh_items`), else below
+  `gamemodes`, else below the source directory. The file's doc comment
+  documents it.
+- **Types.** A `struct`, `enum` or `interface`, `pub` or not, gets a page
+  badged with its keyword, listing its fields (`weight: Number = 1`),
+  variants (`Back = 2`) or members first, then its methods
+  (`fn Item.use(by: Player): Bool`), and its operators. The methods of an
+  `interface Named for Item` implementation are listed on `Item`'s page in a
+  category named `Named`. A struct's parent (`struct Crate : Item`) is
+  shown as the class it extends.
+- **Modules.** A `module Inventory ... end` gets a page badged `module`
+  with its functions and constants; a nested one is `Inventory.Filters`.
+  A module that is reopened, in the same or another file, is one page.
+- **Globals.** A `global Name = value` is listed under `Globals`, as a
+  function when the value is a function.
+- **Lua paths.** `:Owner.name = fn(...) ... end` defines a function on a
+  Lua table, as `Owner.name = function(...)` does in Lua: on `GM`,
+  `Schema` or `PLUGIN` it is a hook handler, on `ENT`, `PANEL` and the
+  other template objects it is part of the file's object. `:PLUGIN.name =
+  'Admin'`, `:ENT.PrintName = 'Crate'` and `:PLUGIN:set_name('Admin')` set
+  metadata as their Lua counterparts do.
+- **Hooks.** `on PlayerSpawn [as 'id'] do |ply| ... end`, `Hook.add` and
+  `Event.on_run` add hook handlers (NL's events are Garry's Mod's hooks);
+  `Event.run`, `Hook.run`, `Hook.call` and Lua paths such as `:hook.Run`
+  run hooks.
+- **Realms.** `if SERVER`, `if not CLIENT`, `unless CLIENT`, their `elseif`
+  and `else` arms, and statement modifiers such as `Event.run 'X' if SERVER`
+  decide the realm, and the arms of one `if` make branch twins, as in Lua.
+
+Signatures are shown as written, with their types and defaults
+(`find(name: String, *rest): Item?`). The types and defaults of the
+signature fill in what a doc comment leaves out: without `@param` tags,
+every parameter is listed with its type; a `@param` without a type gets the
+signature's; without `@return`, the return types are listed. In NL, a
+`@param name text` without brackets is a description, and so is the first
+word inside the brackets of a `@param` or `@return` when it does not look
+like an NL type (`@return [the health left]`).
+
 ## Doc comments
 
 A doc comment starts with `---` and continues on the following `--` lines. It
@@ -261,6 +316,14 @@ documents the declaration that directly follows it: a `function`, a
 `local NAME = ...` (such as `local PANEL = {}`), a top-level
 `local function` of a Lumen template, or a statement that runs a hook
 (`hook.Run('Name', ...)`) or adds one (`hook.Add('Name', ...)`).
+
+In an NL file, a doc comment starts with `##` and continues on the following
+`##` or `#` lines, as for NL's own tools. It documents the declaration or
+statement that directly follows it: a `fn`, `struct`, `enum`, `interface`,
+`module`, `type`, `const` or `global` declaration, a struct field, an enum
+variant, an interface member, an `on` handler, a `:Owner.name = fn`
+assignment or a statement that runs or adds a hook. Fenced code in it
+without a language is highlighted as NL.
 
 The first doc comment that is not attached to anything and comes before the
 first declaration of the file documents the file itself; `@module` names the
@@ -289,7 +352,7 @@ Supported tags:
 
 | Tag | Meaning |
 | --- | --- |
-| `@param name[=default] [Type description]` | A parameter. The default marks it optional. |
+| `@param name[=default] [Type description]` | A parameter. The default marks it optional. Without brackets or a default, the text after the name is its description. |
 | `@return [Type description, Type description]` | Return values; a comma followed by a type starts the next value. |
 | `@variant name(a, b)` | An alternative signature. Indented `@param` and `@return` lines below it belong to the variant, and the text just above it describes it. A `@return` that is not indented applies to the whole function. |
 | `@see [Reference]` or `@see Reference` | A related function or module (`Owner#name`, `Owner:name`, `Owner.name`, `name` or `Owner`). |
@@ -299,7 +362,7 @@ Supported tags:
 | `@deprecation_version [version]` | The version the deprecation starts at. |
 | `@alias [Other.name]` | Another name the function is available under. |
 | `@category [Name]` | On its own, starts a named section that groups the functions below it in the same file. The text after it describes the section. |
-| `@realm [server\|client\|shared]` | Where the code runs, overriding the realm derived from the file name (`sv_`, `cl_`, `sh_`, `init.lua`, `.lumen`, ...), from a server-side package and from `if SERVER` / `if CLIENT` blocks. |
+| `@realm [server\|client\|shared]` | Where the code runs, overriding the realm derived from the file name (`sv_`, `cl_`, `sh_`, `init.lua`, `init.nl`, `.lumen`, ...), from a server-side package and from `if SERVER` / `if CLIENT` blocks. |
 | `@module [Name]` | In the file's doc comment, the module the file documents (`@module [cw.currency]`); above a `local` table, the name of the object it defines. |
 | `@ignore` | Skips the declaration. |
 

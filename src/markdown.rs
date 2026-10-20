@@ -2,7 +2,8 @@
 //!
 //! Two things are layered on top of CommonMark: inline code that names a
 //! documented function or module becomes a link, and fenced code blocks are
-//! syntax-coloured as Lua.
+//! syntax-coloured as Lua, or as NL when marked `nl` (as the unmarked
+//! blocks of NL doc comments are).
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -32,6 +33,7 @@ impl SyntaxHighlighterAdapter for LuaHighlighter {
     fn write_highlighted(&self, output: &mut dyn fmt::Write, lang: Option<&str>, code: &str) -> fmt::Result {
         match lang {
             None | Some("") | Some("lua") | Some("glua") => output.write_str(&highlight_lua(code)),
+            Some("nl") | Some("nlua") => output.write_str(&highlight_nl(code)),
             _ => output.write_str(&esc(code)),
         }
     }
@@ -173,6 +175,31 @@ pub fn highlight_lua(code: &str) -> String {
     out
 }
 
+/// Wraps NL tokens in spans for syntax colouring, with the classes of
+/// `highlight_lua`. NL's own lexer splits the code.
+pub fn highlight_nl(code: &str) -> String {
+    use nl_syntax::SyntaxKind as K;
+    let lexed = nl_syntax::lex(code);
+    let mut out = String::new();
+    for (i, t) in lexed.tokens.iter().enumerate() {
+        let text = t.text(code);
+        let called = lexed.kind(i + 1) == K::L_PAREN;
+        let class = match t.kind {
+            K::COMMENT | K::DOC_COMMENT => Some("c"),
+            K::STRING | K::STR_BEGIN | K::STR_MID | K::STR_END => Some("s"),
+            K::NUMBER => Some("n"),
+            k if k.is_keyword() => Some("k"),
+            K::LNAME | K::CNAME | K::ONAME if called => Some("f"),
+            _ => None,
+        };
+        match class {
+            Some(class) if !text.is_empty() => out.push_str(&format!("<span class=\"hl-{class}\">{}</span>", esc(text))),
+            _ => out.push_str(&esc(text)),
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -200,6 +227,15 @@ mod tests {
             "Call <a href=\"x.html#bar\"><code>Foo.bar</code></a> or <code>baz</code> with <strong>bold</strong>, see <a href=\"http://a.b\">docs</a> or <a href=\"https://x.y/z\">https://x.y/z</a>."
         );
         assert_eq!(inline("a < b & snake_case_name", &none), "a &lt; b &amp; snake_case_name");
+    }
+
+    #[test]
+    fn highlights_nl_blocks() {
+        let html = render("```nl\nfn greet(who) # hi\n  print \"hi #{who}\"\nend\n```", &none);
+        assert_eq!(
+            html,
+            "<pre><code class=\"language-nl\"><span class=\"hl-k\">fn</span> <span class=\"hl-f\">greet</span>(who) <span class=\"hl-c\"># hi</span>\n  print <span class=\"hl-s\">&quot;hi #{</span>who<span class=\"hl-s\">}&quot;</span>\n<span class=\"hl-k\">end</span>\n</code></pre>\n"
+        );
     }
 
     #[test]

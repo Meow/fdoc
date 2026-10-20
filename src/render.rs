@@ -378,7 +378,7 @@ fn module_page(project: &Project, group: &Group, m: &Module) -> String {
     if let Some(sub) = subtitle {
         let _ = write!(body, "<p class=\"subtitle\">{}</p>", esc(sub));
     }
-    if let ModuleKind::Class { extends: Some(base) } = &m.kind {
+    if let ModuleKind::Class { extends: Some(base), .. } = &m.kind {
         let _ = write!(body, "<p class=\"subtitle\">Extends {}</p>", reference_link(project, &root, base));
     }
     if !group.is_core {
@@ -460,7 +460,7 @@ fn flags(f: &Function) -> String {
 
 fn function_detail(project: &Project, root: &str, f: &Function) -> String {
     let mut out = String::new();
-    let _ = writeln!(out, "<section class=\"detail\" id=\"{anchor}\">\n<div class=\"detail-header\">\n<h3 class=\"signature\"><span class=\"owner\">{owner}</span>{name}<span class=\"params\">({params})</span></h3> {realm}{flags}\n<a href=\"#{anchor}\" class=\"detail-link\" title=\"Link to this function\">{icon}</a>\n{source}\n</div>\n<section class=\"docstring\">",
+    let _ = writeln!(out, "<section class=\"detail\" id=\"{anchor}\">\n<div class=\"detail-header\">\n<h3 class=\"signature\"><span class=\"owner\">{owner}</span>{name}<span class=\"params\">{tail}</span></h3> {realm}{flags}\n<a href=\"#{anchor}\" class=\"detail-link\" title=\"Link to this function\">{icon}</a>\n{source}\n</div>\n<section class=\"docstring\">",
         anchor = f.anchor,
         owner = match f.sep {
             Sep::None => String::new(),
@@ -468,7 +468,7 @@ fn function_detail(project: &Project, root: &str, f: &Function) -> String {
             Sep::Colon => format!("{}:", esc(&f.owner)),
         },
         name = esc(&f.name),
-        params = esc(&f.params.join(", ")),
+        tail = esc(&f.tail()),
         realm = realm_pill(f.realm),
         flags = flags(f),
         icon = LINK_ICON,
@@ -772,6 +772,7 @@ fn search_data(project: &Project) -> String {
                         FunctionKind::Declared => "function",
                         FunctionKind::Hook => "hook",
                         FunctionKind::HookAdd => "handler",
+                        FunctionKind::Value => "value",
                     };
                     items.push(entry(&f.qualified_signature(), kind, &format!("{page}#{}", f.anchor), &f.summary(), &m.title, Some(f.realm)));
                 }
@@ -1032,5 +1033,48 @@ end",
         assert!(help.contains("<h1>help <span class=\"badge badge-object badge-definition\">template</span><span class=\"realm realm-client\" title=\"Client-side\">client</span></h1>"), "{help}");
         assert!(help.contains("<p>The Help tab.</p>"), "{help}");
         assert!(page("packages/ui/index.html").contains("<h2>Templates</h2>"));
+    }
+
+    #[test]
+    fn renders_nl_files() {
+        let layout = Layout::default_for("Test");
+        let meta = HashMap::new();
+        let nl = |path: &str, src: &str| (path.to_string(), crate::scanner::scan_file(src, path));
+        let files = vec![
+            nl(
+                "lib/sh_items.nl",
+                "## Items.\n\n## A thing.\npub struct Item\n  ## Its weight.\n  weight: Number = 1\nend\n\n## Uses it.\n## @param by Who uses it\nfn Item.use(by: Player): Bool\n  Event.run 'ItemUsed', self, by\nend\n\n## Finds one.\npub fn find(name: String): Item?\nend\n\n:GM.PlayerSpawned = fn(gm, ply) end\n",
+            ),
+            nl("entities/crate/init.nl", ":ENT.PrintName = 'Crate'\n\n## Sets it up.\n:ENT.Initialize = fn(ent) end\n"),
+            nl("entities/crate/cl_init.nlua", ":ENT.Draw = fn(ent) end\n"),
+            nl("plugins/sh_crosshair.nl", ":PLUGIN:set_name('Crosshair')\n:PLUGIN.HUDPaint = fn(p) end\n"),
+        ];
+        let project = build(placed(&layout, files), BuildOptions { title: Some("Test"), ..BuildOptions::new(&layout, &meta) });
+        let pages = render_all(&project);
+        let page = |path: &str| pages.iter().find(|p| p.path == path).map(|p| p.content.as_str()).unwrap_or_else(|| panic!("no page {path} in {:?}", pages.iter().map(|p| &p.path).collect::<Vec<_>>()));
+
+        let item = page("core/Item.html");
+        assert!(item.contains("<h1>Item <span class=\"badge badge-struct\">struct</span>"), "{item}");
+        assert!(item.contains("<h3 class=\"signature\"><span class=\"owner\">Item.</span>weight<span class=\"params\">: Number = 1</span></h3>"), "{item}");
+        assert!(item.contains("<h3 class=\"signature\"><span class=\"owner\">Item.</span>use<span class=\"params\">(by: Player): Bool</span></h3>"), "{item}");
+        assert!(item.contains("<li><span class=\"param-name\">by</span> <span class=\"type\">Player</span> <span class=\"desc\">Who uses it</span></li>"), "{item}");
+        assert!(item.find("<h2 id=\"fields\"").is_some_and(|fields| item.find("<h2 id=\"methods\"").is_some_and(|methods| fields < methods)), "fields come first: {item}");
+
+        let items = page("core/lib_sh_items.html");
+        assert!(items.contains("<h1>lib/sh_items <span class=\"badge badge-module\">module</span>"), "{items}");
+        assert!(items.contains("<p>Items.</p>"), "the file doc documents the exports: {items}");
+        assert!(items.contains("find<span class=\"params\">(name: String): Item?</span>"), "{items}");
+
+        let hooks = page("core/Hooks.html");
+        assert!(hooks.contains("Item.use"), "the caller is named: {hooks}");
+        assert!(page("core/GM.html").contains("PlayerSpawned<span class=\"params\">(gm, ply)</span>"));
+
+        let crate_page = page("core/crate.html");
+        assert!(crate_page.contains("<h1>Crate <span class=\"badge badge-object badge-definition\">entity</span>"), "one entity of the folder's NL files: {crate_page}");
+        assert!(crate_page.contains("realm-server") && crate_page.contains("realm-client"), "{crate_page}");
+
+        assert!(page("plugins/sh_crosshair/index.html").contains("Crosshair"), "an NL file is a single-file plugin");
+        let data = page("assets/search_data.js");
+        assert!(data.contains("{\"t\":\"Item.weight: Number = 1\",\"k\":\"value\""), "{data}");
     }
 }

@@ -15,8 +15,14 @@ enum Part {
     Literal(String),
     /// `*`: any directory.
     Any,
-    /// `*.lua` as the last component: any Lua file.
+    /// `*.lua` as the last component: any Lua file, or NL file (`.nl`,
+    /// `.nlua`), which stands for one.
     AnyLua,
+}
+
+/// The name of a Lua or NL file without its extension.
+fn lua_stem(name: &str) -> Option<&str> {
+    name.strip_suffix(".lua").or_else(|| name.strip_suffix(".nlua")).or_else(|| name.strip_suffix(".nl"))
 }
 
 /// A `groups` entry of a section.
@@ -101,7 +107,7 @@ impl GroupSpec {
             match part {
                 Part::Literal(l) if l == comp => {}
                 Part::Any => matched.push(*comp),
-                Part::AnyLua if exact => matched.push(comp.strip_suffix(".lua")?),
+                Part::AnyLua if exact => matched.push(lua_stem(comp)?),
                 _ => return None,
             }
         }
@@ -113,7 +119,7 @@ impl GroupSpec {
             self.path.clone()
         };
         let source_dir = comps[..n].join("/");
-        let source_dir = if exact { source_dir.strip_suffix(".lua").map(str::to_string).unwrap_or(source_dir) } else { source_dir };
+        let source_dir = if exact { lua_stem(&source_dir).map(str::to_string).unwrap_or(source_dir) } else { source_dir };
         Some((key, source_dir))
     }
 }
@@ -506,6 +512,8 @@ mod tests {
         assert_eq!(place(&l, "plugins/stats/plugin/views/lumen/character_sheet.lumen"), Some((2, "stats".into(), "plugins/stats".into(), false)));
         assert_eq!(place(&l, "views/lumen/menu.lumen"), Some((0, String::new(), "core".into(), true)));
         assert_eq!(place(&l, "plugins/menu.lumen").map(|p| p.0), Some(0), "a template is not a single-file plugin");
+        assert_eq!(place(&l, "plugins/sh_crosshair.nl"), place(&l, "plugins/sh_crosshair.lua"), "an NL file stands for a Lua file");
+        assert_eq!(l.classify("plugins/sh_crosshair.nlua").unwrap().source_dir, "plugins/sh_crosshair");
     }
 
     const CATWORK: &str = "

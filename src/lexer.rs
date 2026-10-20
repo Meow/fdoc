@@ -64,12 +64,32 @@ pub enum Syntax {
     /// `<view style={s}>Hi, {name}</view>` may stand wherever an expression
     /// may.
     Lumen,
+    /// NL (`.nl`, `.nlua`), which compiles to Lua. It is read with NL's own
+    /// parser (see `crate::nl`), not with this lexer.
+    Nl,
 }
 
 impl Syntax {
-    /// `Lumen` for a `.lumen` file, `Lua` for anything else.
+    /// `Lumen` for a `.lumen` file, `Nl` for a `.nl` or `.nlua` file, `Lua`
+    /// for anything else.
     pub fn of_path(path: &str) -> Syntax {
-        if path.ends_with(".lumen") { Syntax::Lumen } else { Syntax::Lua }
+        if path.ends_with(".lumen") {
+            Syntax::Lumen
+        } else if path.ends_with(".nl") || path.ends_with(".nlua") {
+            Syntax::Nl
+        } else {
+            Syntax::Lua
+        }
+    }
+}
+
+/// The name of the Lua file a file stands for: an NL file `x.nl` or
+/// `x.nlua` is `x.lua` wherever Garry's Mod looks for Lua (with NL's
+/// `lua_shared`). Other names are returned as they are.
+pub fn lua_name(name: &str) -> std::borrow::Cow<'_, str> {
+    match name.strip_suffix(".nlua").or_else(|| name.strip_suffix(".nl")) {
+        Some(stem) => format!("{stem}.lua").into(),
+        None => name.into(),
     }
 }
 

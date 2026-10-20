@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use crate::doc::{DocBlock, Environment, Realm};
 use crate::layout::{GroupMeta, Layout, Placement};
-use crate::lexer::Syntax;
+use crate::lexer::{lua_name, Syntax};
 use crate::scanner::{path_realm, Category, FileScan, FunctionDecl, Sep};
 
 /// Template objects that the loader injects as globals and redefines per
@@ -39,7 +39,7 @@ const LOCAL_DEFINITIONS: [(&str, &str); 2] = [("COMMAND", "Command"), ("CLASS", 
 const DEFINITION_ORDER: [&str; 15] = ["Commands", "Items", "Factions", "Classes", "Roles", "Attributes", "Conditions", "Entities", "Weapons", "Effects", "Tools", "Panels", "Templates", "Themes", "Skins"];
 
 /// File names of an entity, weapon or effect folder; the files of one folder
-/// form one module.
+/// form one module. An NL file counts as the Lua file it stands for.
 const ENTITY_FILES: [&str; 3] = ["init.lua", "cl_init.lua", "shared.lua"];
 
 /// Fields that give an object its display title, in order of preference.
@@ -63,7 +63,9 @@ const META_NAMES: [(&str, &str); 12] = [
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ModuleKind {
-    Class { extends: Option<String> },
+    /// A class, or an NL `struct`, `enum`, `interface` or `module`, whose
+    /// keyword is its badge.
+    Class { extends: Option<String>, keyword: Option<&'static str> },
     Library,
     /// The hooks a group runs (`hook.Run`, `hook.Call`, `Plugin.call`, ...),
     /// one function per hook name.
@@ -113,7 +115,7 @@ fn definition_rank(plural: &str) -> (usize, String) {
 impl ModuleKind {
     pub fn badge(&self) -> &str {
         match self {
-            ModuleKind::Class { .. } => "class",
+            ModuleKind::Class { keyword, .. } => keyword.unwrap_or("class"),
             ModuleKind::Library => "library",
             ModuleKind::Hooks => "hooks",
             ModuleKind::Handlers { object } => match object.as_str() {
@@ -138,6 +140,9 @@ pub enum FunctionKind {
     Hook,
     /// A handler added with `hook.Add`.
     HookAdd,
+    /// An NL value: a struct field, enum variant, constant, global or type
+    /// alias. It has no parameters.
+    Value,
 }
 
 /// The definition of a branch twin in the `else` arm of the `if` statement
@@ -196,6 +201,11 @@ pub struct Function {
     /// `template_part`), such as a command's subcommand: the part's name,
     /// which `owner` starts with.
     pub part: Option<String>,
+    /// NL only: the return type of a function, or the type of a value, as
+    /// written.
+    pub ty: Option<String>,
+    /// NL only: what a value is given, as written (see `FunctionDecl::init`).
+    pub init: Option<String>,
 }
 
 impl Function {
@@ -214,12 +224,28 @@ impl Function {
         if self.part.is_some() { self.qualified() } else { self.name.clone() }
     }
 
+    /// What follows the name in a signature: the parameters and an NL
+    /// return type, `(a, b: Number): String`, or for a value its type and
+    /// what it is given, `: Number = 100`.
+    pub fn tail(&self) -> String {
+        let mut out = if self.kind == FunctionKind::Value { String::new() } else { format!("({})", self.params.join(", ")) };
+        if let Some(ty) = &self.ty {
+            out.push_str(": ");
+            out.push_str(ty);
+        }
+        if let Some(init) = self.init.as_ref().filter(|_| self.kind == FunctionKind::Value) {
+            out.push_str(" = ");
+            out.push_str(init);
+        }
+        out
+    }
+
     pub fn signature(&self) -> String {
-        format!("{}({})", self.label(), self.params.join(", "))
+        format!("{}{}", self.label(), self.tail())
     }
 
     pub fn qualified_signature(&self) -> String {
-        format!("{}({})", self.qualified(), self.params.join(", "))
+        format!("{}{}", self.qualified(), self.tail())
     }
 
     pub fn summary(&self) -> String {
@@ -364,11 +390,11 @@ impl<'a> BuildOptions<'a> {
     }
 }
 
-/// The last component of a `/` separated path without its `.lua` or
-/// `.lumen` extension.
+/// The last component of a `/` separated path without its `.lua`,
+/// `.lumen`, `.nl` or `.nlua` extension.
 pub fn file_stem(path: &str) -> &str {
     let last = path.rsplit('/').next().unwrap_or(path);
-    last.strip_suffix(".lua").or_else(|| last.strip_suffix(".lumen")).unwrap_or(last)
+    [".lua", ".lumen", ".nlua", ".nl"].iter().find_map(|ext| last.strip_suffix(ext)).unwrap_or(last)
 }
 
 /// The file stem without its `sv_`, `cl_` or `sh_` realm prefix.
@@ -949,7 +975,7 @@ fn owner_target(gb: &GroupBuilder, group_title: &str, path: &str, scan: &FileSca
         let kind = ModuleKind::Object { object: first.to_string() };
         let label = per_file_label(first);
         let file = path.rsplit('/').next().unwrap_or(path);
-        if ENTITY_FILES.contains(&file)
+        if ENTITY_FILES.contains(&lua_name(file).as_ref())
             && let Some(dir) = parent_dir(path)
         {
             let folder = &path[..path.len() - file.len() - 1];
@@ -992,7 +1018,7 @@ fn ensure_category(m: &mut Module, name: &str, file_categories: &HashMap<&str, &
 /// Adds a declared function, merging it into a realm twin: a function of
 /// the same name, on the same part, defined for another realm.
 fn add_function(m: &mut Module, f: Function) {
-    let twin = m.functions.iter().position(|e| e.kind == FunctionKind::Declared && e.name == f.name && e.sep == f.sep && e.part == f.part && !e.sources.iter().any(|s| s.2 == f.realm));
+    let twin = m.functions.iter().position(|e| e.kind == f.kind && matches!(e.kind, FunctionKind::Declared | FunctionKind::Value) && e.name == f.name && e.sep == f.sep && e.part == f.part && !e.sources.iter().any(|s| s.2 == f.realm));
     match twin {
         Some(i) => merge_twin(&mut m.functions[i], f),
         None => m.functions.push(f),
@@ -1081,8 +1107,8 @@ fn build_modules(gb: &GroupBuilder, group_title: &str, documented_only: bool, ca
     for (path, scan) in &gb.files {
         for class in &scan.classes {
             let id = class.name.replace("::", ".");
-            let m = modules.entry(id.to_ascii_lowercase()).or_insert_with(|| new_module(&id, ModuleKind::Class { extends: None }));
-            m.kind = ModuleKind::Class { extends: class.extends.as_ref().map(|e| e.replace("::", ".")) };
+            let m = modules.entry(id.to_ascii_lowercase()).or_insert_with(|| new_module(&id, ModuleKind::Class { extends: None, keyword: None }));
+            m.kind = ModuleKind::Class { extends: class.extends.as_ref().map(|e| e.replace("::", ".")), keyword: class.keyword };
             if m.doc.is_none() {
                 m.doc = class.doc.clone();
             }
@@ -1142,7 +1168,7 @@ fn build_modules(gb: &GroupBuilder, group_title: &str, documented_only: bool, ca
                 m.files.push(path.clone());
             }
             if matches!(m.kind, ModuleKind::Library) && f.sep == Sep::Colon {
-                m.kind = ModuleKind::Class { extends: None };
+                m.kind = ModuleKind::Class { extends: None, keyword: None };
             }
 
             let category = f.category.clone().or_else(|| part.map(|(p, _)| p.category.clone())).unwrap_or_else(|| match (&m.kind, f.sep) {
@@ -1170,7 +1196,7 @@ fn build_modules(gb: &GroupBuilder, group_title: &str, documented_only: bool, ca
                     line: f.line,
                     anchor: String::new(),
                     category,
-                    kind: FunctionKind::Declared,
+                    kind: if f.value { FunctionKind::Value } else { FunctionKind::Declared },
                     realm,
                     sources,
                     doc_realm: realm,
@@ -1180,6 +1206,8 @@ fn build_modules(gb: &GroupBuilder, group_title: &str, documented_only: bool, ca
                     hook_id: None,
                     implements: None,
                     part: part.map(|(p, _)| p.name.clone()),
+                    ty: f.ty.clone(),
+                    init: f.init.clone(),
                 },
             );
             if matches!(m.kind, ModuleKind::Handlers { .. }) {
@@ -1236,6 +1264,8 @@ fn build_modules(gb: &GroupBuilder, group_title: &str, documented_only: bool, ca
                     hook_id: None,
                     implements: None,
                     part: None,
+                    ty: None,
+                    init: None,
                 },
             );
         }
@@ -1277,6 +1307,8 @@ fn build_modules(gb: &GroupBuilder, group_title: &str, documented_only: bool, ca
                 hook_id: add.id.clone(),
                 implements: None,
                 part: None,
+                ty: None,
+                init: None,
             });
         }
     }
@@ -1330,6 +1362,8 @@ fn build_modules(gb: &GroupBuilder, group_title: &str, documented_only: bool, ca
             hook_id: None,
             implements: None,
             part: None,
+            ty: None,
+            init: None,
         });
     }
     if !hooks.functions.is_empty() {
@@ -1343,7 +1377,7 @@ fn build_modules(gb: &GroupBuilder, group_title: &str, documented_only: bool, ca
     // file. A template's file doc documents the template.
     let mut file_docs: HashMap<String, ((bool, usize), &DocBlock)> = HashMap::new();
     for (order, (path, scan)) in gb.files.iter().enumerate() {
-        let Some(doc) = scan.file_doc.as_ref().filter(|d| !is_banner(d) && Syntax::of_path(path) == Syntax::Lua) else { continue };
+        let Some(doc) = scan.file_doc.as_ref().filter(|d| !is_banner(d) && Syntax::of_path(path) != Syntax::Lumen) else { continue };
         let by_id = |id: &str| modules.iter().find(|(_, m)| m.id.eq_ignore_ascii_case(id) && m.kind != ModuleKind::Hooks).map(|(k, _)| k.clone());
         let objects = file_objects.get(path.as_str()).map(Vec::as_slice).unwrap_or_default();
         let single_object = (objects.len() == 1 && scan.libraries.is_empty()).then(|| objects[0].clone());
@@ -1462,11 +1496,18 @@ fn build_modules(gb: &GroupBuilder, group_title: &str, documented_only: bool, ca
         // Default categories first, then custom ones in order of appearance.
         m.categories.sort_by_key(|c| match c.name.as_str() {
             "Hooks" => 0,
-            "Functions" => 1,
-            "Methods" => 2,
-            _ => 3,
+            "Variants" | "Fields" => 1,
+            "Functions" => 2,
+            "Methods" => 3,
+            _ => 4,
         });
-        m.functions.sort_by(|a, b| a.label().to_ascii_lowercase().cmp(&b.label().to_ascii_lowercase()).then(a.file.cmp(&b.file)));
+        // Functions by name; values (fields, variants, ...) in the order
+        // they are declared in, after them, as they are in categories of
+        // their own.
+        m.functions.sort_by_cached_key(|f| match f.kind {
+            FunctionKind::Value => (true, String::new(), f.file.clone(), f.line),
+            _ => (false, f.label().to_ascii_lowercase(), f.file.clone(), 0),
+        });
         let mut anchors: HashSet<String> = HashSet::new();
         for f in &mut m.functions {
             let base = slugify(&f.label());
@@ -1516,7 +1557,7 @@ fn build_index(project: &Project) -> HashMap<String, String> {
                 }
                 // Declared functions take their names before hook handlers.
                 let mut functions: Vec<&Function> = m.functions.iter().collect();
-                functions.sort_by_key(|f| f.kind != FunctionKind::Declared);
+                functions.sort_by_key(|f| !matches!(f.kind, FunctionKind::Declared | FunctionKind::Value));
                 for f in functions {
                     let url = format!("{page}#{}", f.anchor);
                     match f.kind {
@@ -1533,7 +1574,7 @@ fn build_index(project: &Project) -> HashMap<String, String> {
                             insert(format!("{}#{}", m.id, f.name), &url);
                             continue;
                         }
-                        FunctionKind::Declared => {}
+                        FunctionKind::Declared | FunctionKind::Value => {}
                     }
                     // A template's local functions are only known through
                     // the template: `help_commands#Command`.
