@@ -156,16 +156,12 @@ fn first_paragraph(text: &str) -> String {
     let mut out = Vec::new();
     for line in text.lines() {
         let t = line.trim();
-        if t.is_empty() || t.starts_with("```") {
-            if !out.is_empty() {
-                break;
-            }
-            if t.starts_with("```") {
-                break;
-            }
-            continue;
+        if t.starts_with("```") || (t.is_empty() && !out.is_empty()) {
+            break;
         }
-        out.push(t);
+        if !t.is_empty() {
+            out.push(t);
+        }
     }
     out.join(" ")
 }
@@ -247,11 +243,10 @@ fn classify(lines: &[String]) -> Vec<Line> {
         }
         if !in_fence && trimmed.starts_with('@') {
             let indent = line.len() - trimmed.len();
-            let (name, body) = match trimmed[1..].find(char::is_whitespace) {
+            let (name, mut body) = match trimmed[1..].find(char::is_whitespace) {
                 Some(p) => (trimmed[1..1 + p].to_string(), trimmed[1 + p..].trim().to_string()),
                 None => (trimmed[1..].to_string(), String::new()),
             };
-            let mut body = body;
             // A `[` without a matching `]` continues on the following lines.
             while bracket_open(&body) && i + 1 < lines.len() {
                 let next = lines[i + 1].trim();
@@ -397,12 +392,9 @@ pub fn parse_lines(lines: &[String]) -> DocBlock {
     let mut pending_has_first_line = false;
     let mut seen_text = false;
     let mut in_fence = false;
-    // Index into doc.variants while nested `@param`s belong to a variant.
+    // Index into doc.variants and indentation of the open `@variant`, while
+    // nested `@param`s belong to it.
     let mut current_variant: Option<(usize, usize)> = None;
-
-    let flush = |pending: &mut Vec<String>, description: &mut Vec<String>| {
-        description.append(pending);
-    };
 
     for item in items {
         match item {
@@ -411,15 +403,9 @@ pub fn parse_lines(lines: &[String]) -> DocBlock {
                 if trimmed.starts_with("```") {
                     in_fence = !in_fence;
                 }
-                if in_fence || trimmed.starts_with("```") {
-                    flush(&mut pending, &mut description);
-                    description.push(text);
-                    pending_has_first_line = false;
-                    continue;
-                }
-                if trimmed.is_empty() {
-                    flush(&mut pending, &mut description);
-                    description.push(String::new());
+                if in_fence || trimmed.starts_with("```") || trimmed.is_empty() {
+                    description.append(&mut pending);
+                    description.push(if trimmed.is_empty() { String::new() } else { text });
                     pending_has_first_line = false;
                     continue;
                 }
@@ -449,9 +435,9 @@ pub fn parse_lines(lines: &[String]) -> DocBlock {
                     }
                 }
                 if lname != "variant" {
-                    flush(&mut pending, &mut description);
+                    description.append(&mut pending);
                     pending_has_first_line = false;
-                    if indent == 0 || current_variant.is_none() {
+                    if indent == 0 {
                         current_variant = None;
                     }
                 }
@@ -536,7 +522,7 @@ pub fn parse_lines(lines: &[String]) -> DocBlock {
             }
         }
     }
-    flush(&mut pending, &mut description);
+    description.append(&mut pending);
 
     // Collapse runs of blank lines and trim.
     let mut out: Vec<String> = Vec::new();

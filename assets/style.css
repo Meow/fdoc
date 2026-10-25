@@ -228,7 +228,6 @@ th { background: var(--code-background); }
 }
 .sidebar-row > a:hover { color: var(--main); text-decoration: none; }
 .sidebar-row.active > a { color: var(--main); font-weight: 600; }
-.sidebar-row > a.active { color: var(--main); font-weight: 600; }
 .chevron {
   background: none; border: none; cursor: pointer; color: var(--text-light);
   width: 2.4em; height: 2.1em; display: inline-flex; align-items: center; justify-content: center; flex: none;
@@ -265,7 +264,6 @@ th { background: var(--code-background); }
   color: var(--main); background: var(--sidebar-active-background);
 }
 .sidebar-heading-count { font-size: 0.72em; color: var(--text-light); font-variant-numeric: tabular-nums; opacity: 0.85; }
-.sidebar-section-title { padding: 1.2em 1.2em 0.3em; font-size: 0.74em; letter-spacing: 0.06em; text-transform: uppercase; color: var(--text-light); font-weight: 600; }
 .sidebar-noscript { padding: 0.5em 1.4em; }
 
 .sidebar-toggle { display: none; position: fixed; top: 0.55em; left: 0.6em; z-index: 25; background: var(--background); border: 1px solid var(--border); color: var(--text); border-radius: 6px; padding: 0.3em; cursor: pointer; }

@@ -101,14 +101,20 @@ const LUA_KEYWORDS: [&str; 24] = [
     "and", "break", "do", "else", "elseif", "end", "false", "for", "function", "goto", "if", "in", "local", "nil", "not", "or", "repeat", "return", "then", "true", "until", "while", "continue", "self",
 ];
 
+/// Appends `text` wrapped in a `hl-<class>` span.
+fn push(out: &mut String, class: &str, text: &str) {
+    out.push_str("<span class=\"hl-");
+    out.push_str(class);
+    out.push_str("\">");
+    out.push_str(&esc(text));
+    out.push_str("</span>");
+}
+
 /// Wraps Lua tokens in spans for syntax colouring.
 pub fn highlight_lua(code: &str) -> String {
     let b = code.as_bytes();
     let mut out = String::new();
     let mut i = 0;
-    let push = |out: &mut String, class: &str, s: &str| {
-        out.push_str(&format!("<span class=\"hl-{class}\">{}</span>", esc(s)));
-    };
     while i < b.len() {
         let c = b[i];
         if c == b'-' && b.get(i + 1) == Some(&b'-') || c == b'/' && b.get(i + 1) == Some(&b'/') {
@@ -193,7 +199,7 @@ pub fn highlight_nl(code: &str) -> String {
             _ => None,
         };
         match class {
-            Some(class) if !text.is_empty() => out.push_str(&format!("<span class=\"hl-{class}\">{}</span>", esc(text))),
+            Some(class) if !text.is_empty() => push(&mut out, class, text),
             _ => out.push_str(&esc(text)),
         }
     }

@@ -29,6 +29,15 @@ pub(crate) const MAX_SOURCE_LEN: usize = 80;
 /// Longest source rendering kept for `Branch::condition`.
 pub(crate) const MAX_CONDITION_LEN: usize = 60;
 
+/// `text` cut after `max` characters, with an ellipsis when it was longer.
+pub(crate) fn cut(text: String, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text;
+    }
+    let head: String = text.chars().take(max).collect();
+    format!("{}…", head.trim_end())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Sep {
     /// `Owner.name` - a function stored in a table.
@@ -226,8 +235,7 @@ impl Frame {
 
     /// The `if` statement at token `i`.
     fn conditional(toks: &[Token], i: usize) -> Frame {
-        let condition = render(toks, i + 1..condition_end(toks, i + 1));
-        let condition = if condition.chars().count() > MAX_CONDITION_LEN { format!("{}…", condition.chars().take(MAX_CONDITION_LEN).collect::<String>().trim_end()) } else { condition };
+        let condition = cut(render(toks, i + 1..condition_end(toks, i + 1)), MAX_CONDITION_LEN);
         Frame { branch: Some(Branch { if_id: i, else_branch: false, condition }), ..Frame::other(condition_realm(toks, i + 1)) }
     }
 }
@@ -991,8 +999,7 @@ fn render(toks: &[Token], range: Range<usize>) -> String {
         out.push_str(&text);
         prev = Some(t);
         if out.chars().count() > MAX_SOURCE_LEN {
-            let cut: String = out.chars().take(MAX_SOURCE_LEN).collect();
-            return format!("{}…", cut.trim_end());
+            return cut(out, MAX_SOURCE_LEN);
         }
     }
     out

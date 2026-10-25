@@ -240,10 +240,10 @@ fn run(args: Args) -> Result<(), String> {
     if files.is_empty() {
         return Err(format!("no .lua, .lumen, .nl or .nlua files found in {}", source.display()));
     }
-    // Files outside every group of the layout are not scanned, apart from
-    // the `packagespec.lua` files that `read_packages` reads. The
-    // built-in layout is titled once the root packagespec is read; the
-    // title does not change where files are placed.
+    // Only the files inside a group of the layout are scanned (plus the
+    // `packagespec.lua` files `read_packages` looks at). The built-in layout
+    // takes its section title from the root packagespec, which is only
+    // known after scanning; the title does not affect where files go.
     let total = files.len();
     let configured = config.layout.is_some();
     let mut layout = config.layout.unwrap_or_else(|| Layout::default_for(""));
@@ -284,7 +284,13 @@ fn run(args: Args) -> Result<(), String> {
     );
 
     if args.clean && output.exists() {
-        if same_path(&output, source) || source.canonicalize().map(|s| s.starts_with(output.canonicalize().unwrap_or_default())).unwrap_or(false) {
+        // Both exist at this point, so canonicalising only fails on a
+        // permission problem; refusing is the safe answer then.
+        let holds_source = match (source.canonicalize(), output.canonicalize()) {
+            (Ok(s), Ok(o)) => s.starts_with(o),
+            _ => true,
+        };
+        if holds_source {
             return Err(format!("refusing to clean {}: it contains the source directory", output.display()));
         }
         fs::remove_dir_all(&output).map_err(|e| format!("cannot remove {}: {e}", output.display()))?;

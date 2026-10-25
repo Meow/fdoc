@@ -209,6 +209,34 @@ pub struct Function {
 }
 
 impl Function {
+    /// A global function of `kind` defined once, at `file:line`, with no
+    /// owner, parameters or doc yet.
+    fn new(name: String, kind: FunctionKind, file: &str, line: usize, realm: Realm) -> Function {
+        Function {
+            name,
+            owner: String::new(),
+            sep: Sep::None,
+            params: Vec::new(),
+            doc: None,
+            file: file.to_string(),
+            line,
+            anchor: String::new(),
+            category: String::new(),
+            kind,
+            realm,
+            sources: vec![(file.to_string(), line, realm)],
+            doc_realm: realm,
+            client_doc: None,
+            otherwise: None,
+            callers: Vec::new(),
+            hook_id: None,
+            implements: None,
+            part: None,
+            ty: None,
+            init: None,
+        }
+    }
+
     pub fn qualified(&self) -> String {
         match self.sep {
             Sep::None => self.name.clone(),
@@ -569,7 +597,9 @@ pub fn build(files: Vec<PlacedFile>, opts: BuildOptions) -> Project {
     project
 }
 
-fn resolve_owner(owner: &str, scan: &FileScan, plugin_global: &Option<String>) -> String {
+/// The owner a function is documented under: metatable locals become the
+/// metatable's name and `PLUGIN` becomes the plugin's global alias.
+fn resolve_owner(owner: &str, scan: &FileScan, plugin_global: Option<&str>) -> String {
     let mut owner = owner.replace("::", ".");
     if let Some((_, target)) = scan.meta_aliases.iter().find(|(a, _)| *a == owner) {
         owner = target.clone();
@@ -577,7 +607,7 @@ fn resolve_owner(owner: &str, scan: &FileScan, plugin_global: &Option<String>) -
         owner = target.to_string();
     }
     if let (true, Some(g)) = (owner == "PLUGIN", plugin_global) {
-        owner = g.clone();
+        owner = g.to_string();
     }
     owner
 }
@@ -871,12 +901,12 @@ fn handler_target(owner: &str, object: &str, group_title: &str) -> Target {
 }
 
 /// The handler object an owner stands for, if it is a hook table.
-fn handler_object(raw_owner: &str, owner: &str, plugin_global: &Option<String>, plugin_tables: &HashSet<String>) -> Option<&'static str> {
+fn handler_object(raw_owner: &str, owner: &str, plugin_global: Option<&str>, plugin_tables: &HashSet<String>) -> Option<&'static str> {
     if owner == "GM" {
         Some("GM")
     } else if owner == "Schema" {
         Some("Schema")
-    } else if raw_owner == "PLUGIN" || plugin_global.as_deref() == Some(owner) || plugin_tables.contains(owner) {
+    } else if raw_owner == "PLUGIN" || plugin_global == Some(owner) || plugin_tables.contains(owner) {
         Some("PLUGIN")
     } else {
         None
@@ -995,7 +1025,7 @@ fn owner_target(gb: &GroupBuilder, group_title: &str, path: &str, scan: &FileSca
         t.definition = label.map(str::to_string);
         return t;
     }
-    if let Some(object) = handler_object(&f.owner, owner, &gb.plugin_global, plugin_tables) {
+    if let Some(object) = handler_object(&f.owner, owner, gb.plugin_global.as_deref(), plugin_tables) {
         return handler_target(owner, object, group_title);
     }
     Target::new(owner.to_ascii_lowercase(), owner.to_string(), ModuleKind::Library)
@@ -1151,7 +1181,7 @@ fn build_modules(gb: &GroupBuilder, group_title: &str, documented_only: bool, ca
             let part = f.local_table.and_then(|i| parts[i].as_ref().map(|p| (p, &scan.locals[i].name)));
             let owner = match part {
                 Some((p, local)) => format!("{}{}", p.name, f.owner.strip_prefix(local.as_str()).unwrap_or_default()),
-                None => resolve_owner(&f.owner, scan, &gb.plugin_global),
+                None => resolve_owner(&f.owner, scan, gb.plugin_global.as_deref()),
             };
             let target = match (part, f.local_table.and_then(|i| objects[i].clone())) {
                 (Some((p, _)), _) => owner_target(gb, group_title, path, scan, f, &p.object, &plugin_tables),
@@ -1179,37 +1209,23 @@ fn build_modules(gb: &GroupBuilder, group_title: &str, documented_only: bool, ca
             ensure_category(m, &category, &file_categories);
 
             let realm = definition_realm(f.doc.as_ref(), f.realm, gb.realm(path));
-            let mut sources = vec![(path.clone(), f.line, realm)];
-            let otherwise = other.map(|o| {
-                sources.push((path.clone(), o.line, realm));
-                Otherwise { condition: f.branch.as_ref().map(|b| b.condition.clone()).unwrap_or_default(), doc: o.doc.clone(), file: path.clone(), line: o.line }
-            });
-            add_function(
-                m,
-                Function {
-                    name: f.name.clone(),
-                    owner: owner.clone(),
-                    sep: f.sep,
-                    params: f.params.clone(),
-                    doc: f.doc.clone(),
-                    file: path.clone(),
-                    line: f.line,
-                    anchor: String::new(),
-                    category,
-                    kind: if f.value { FunctionKind::Value } else { FunctionKind::Declared },
-                    realm,
-                    sources,
-                    doc_realm: realm,
-                    client_doc: None,
-                    otherwise,
-                    callers: Vec::new(),
-                    hook_id: None,
-                    implements: None,
-                    part: part.map(|(p, _)| p.name.clone()),
-                    ty: f.ty.clone(),
-                    init: f.init.clone(),
-                },
-            );
+            let kind = if f.value { FunctionKind::Value } else { FunctionKind::Declared };
+            let mut function = Function {
+                owner: owner.clone(),
+                sep: f.sep,
+                params: f.params.clone(),
+                doc: f.doc.clone(),
+                category,
+                part: part.map(|(p, _)| p.name.clone()),
+                ty: f.ty.clone(),
+                init: f.init.clone(),
+                ..Function::new(f.name.clone(), kind, path, f.line, realm)
+            };
+            if let Some(o) = other {
+                function.sources.push((path.clone(), o.line, realm));
+                function.otherwise = Some(Otherwise { condition: f.branch.as_ref().map(|b| b.condition.clone()).unwrap_or_default(), doc: o.doc.clone(), file: path.clone(), line: o.line });
+            }
+            add_function(m, function);
             if matches!(m.kind, ModuleKind::Handlers { .. }) {
                 file_handler.entry(path).or_insert_with(|| key.clone());
             }
@@ -1242,32 +1258,7 @@ fn build_modules(gb: &GroupBuilder, group_title: &str, documented_only: bool, ca
             let category = f.category.clone().unwrap_or_else(|| "Functions".to_string());
             ensure_category(&mut m, &category, &file_categories);
             let realm = definition_realm(f.doc.as_ref(), f.realm, gb.realm(path));
-            add_function(
-                &mut m,
-                Function {
-                    name: f.name.clone(),
-                    owner: String::new(),
-                    sep: Sep::None,
-                    params: f.params.clone(),
-                    doc: f.doc.clone(),
-                    file: path.clone(),
-                    line: f.line,
-                    anchor: String::new(),
-                    category,
-                    kind: FunctionKind::Declared,
-                    realm,
-                    sources: vec![(path.clone(), f.line, realm)],
-                    doc_realm: realm,
-                    client_doc: None,
-                    otherwise: None,
-                    callers: Vec::new(),
-                    hook_id: None,
-                    implements: None,
-                    part: None,
-                    ty: None,
-                    init: None,
-                },
-            );
+            add_function(&mut m, Function { params: f.params.clone(), doc: f.doc.clone(), category, ..Function::new(f.name.clone(), FunctionKind::Declared, path, f.line, realm) });
         }
         modules.insert(format!("\u{2}template\u{0}{path}"), m);
     }
@@ -1288,40 +1279,21 @@ fn build_modules(gb: &GroupBuilder, group_title: &str, documented_only: bool, ca
             ensure_category(m, "Hooks", &HashMap::new());
             let realm = definition_realm(add.doc.as_ref(), add.realm, gb.realm(path));
             m.functions.push(Function {
-                name: add.name.clone(),
-                owner: String::new(),
-                sep: Sep::None,
                 params: add.params.clone(),
                 doc: add.doc.clone(),
-                file: path.clone(),
-                line: add.line,
-                anchor: String::new(),
                 category: "Hooks".to_string(),
-                kind: FunctionKind::HookAdd,
-                realm,
-                sources: vec![(path.clone(), add.line, realm)],
-                doc_realm: realm,
-                client_doc: None,
-                otherwise: None,
-                callers: Vec::new(),
                 hook_id: add.id.clone(),
-                implements: None,
-                part: None,
-                ty: None,
-                init: None,
+                ..Function::new(add.name.clone(), FunctionKind::HookAdd, path, add.line, realm)
             });
         }
     }
 
     // The hooks the group runs, one function per name. Callers are kept as
     // `file\0caller` until the module ids are final.
-    let mut hook_sites: Vec<(String, Vec<(&str, &crate::scanner::HookCall)>)> = Vec::new();
+    let mut hook_sites: BTreeMap<&str, Vec<(&str, &crate::scanner::HookCall)>> = BTreeMap::new();
     for (path, scan) in &gb.files {
         for call in &scan.hook_calls {
-            match hook_sites.iter_mut().find(|(name, _)| *name == call.name) {
-                Some((_, sites)) => sites.push((path, call)),
-                None => hook_sites.push((call.name.clone(), vec![(path, call)])),
-            }
+            hook_sites.entry(&call.name).or_default().push((path, call));
         }
     }
     let mut hooks = new_module("Hooks", ModuleKind::Hooks);
@@ -1329,7 +1301,7 @@ fn build_modules(gb: &GroupBuilder, group_title: &str, documented_only: bool, ca
     hooks.categories.push(Category { name: "Hooks".to_string(), description: String::new() });
     for (name, sites) in hook_sites {
         let documented = sites.iter().find(|(_, c)| c.doc.is_some());
-        let doc = documented.and_then(|(_, c)| c.doc.clone()).or_else(|| handler_doc(&modules, &name));
+        let doc = documented.and_then(|(_, c)| c.doc.clone()).or_else(|| handler_doc(&modules, name));
         if documented_only && doc.is_none() {
             continue;
         }
@@ -1343,27 +1315,12 @@ fn build_modules(gb: &GroupBuilder, group_title: &str, documented_only: bool, ca
             }
         }
         hooks.functions.push(Function {
-            name,
-            owner: String::new(),
-            sep: Sep::None,
             params: widest.args.clone(),
             doc,
-            file: file.to_string(),
-            line: primary.line,
-            anchor: String::new(),
             category: "Hooks".to_string(),
-            kind: FunctionKind::Hook,
-            realm,
             sources,
-            doc_realm: realm,
-            client_doc: None,
-            otherwise: None,
             callers: sites.iter().filter_map(|(p, c)| c.caller.as_ref().map(|caller| format!("{p}\u{0}{caller}"))).collect(),
-            hook_id: None,
-            implements: None,
-            part: None,
-            ty: None,
-            init: None,
+            ..Function::new(name.to_string(), FunctionKind::Hook, file, primary.line, realm)
         });
     }
     if !hooks.functions.is_empty() {
@@ -1696,7 +1653,7 @@ mod tests {
         assert_eq!(names, vec!["fl_a", "fl_b"]);
 
         let plugins = &p.sections[2];
-        assert_eq!(plugins.groups[0].title, "Characters".to_string().replace("Characters", "characters"));
+        assert_eq!(plugins.groups[0].title, "characters", "a plugin without a name is titled after its directory");
         let chars = &plugins.groups[0].modules[0];
         assert_eq!(chars.id, "Characters");
         assert_eq!(chars.functions.len(), 2, "PLUGIN and the global merge");

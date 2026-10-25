@@ -168,17 +168,17 @@ impl Lexer<'_> {
 
         // Comments: `--`, `--[[ ]]`, `//`, `/* */`.
         if c == b'-' && b.get(i + 1) == Some(&b'-') {
-            let i = i + 2;
-            if let Some(level) = long_bracket_level(b, i) {
+            let start = i + 2;
+            if let Some(level) = long_bracket_level(b, start) {
                 let open_len = level + 2;
-                let (text, end, nl) = read_long(b, i + open_len, level);
+                let (text, end, nl) = read_long(b, start + open_len, level);
                 self.line += nl;
                 self.i = end;
                 return Tok::Comment { text, long: true };
             }
-            let end = line_end(b, i);
+            let end = line_end(b, start);
             self.i = end;
-            return Tok::Comment { text: String::from_utf8_lossy(&b[i..end]).into_owned(), long: false };
+            return Tok::Comment { text: String::from_utf8_lossy(&b[start..end]).into_owned(), long: false };
         }
         if c == b'/' && b.get(i + 1) == Some(&b'/') {
             let end = line_end(b, i + 2);
@@ -194,17 +194,18 @@ impl Lexer<'_> {
                 }
                 j += 1;
             }
-            let text = String::from_utf8_lossy(&b[i + 2..j.min(b.len())]).into_owned();
+            let text = String::from_utf8_lossy(&b[i + 2..j]).into_owned();
             self.line += nl;
             self.i = (j + 2).min(b.len());
             return Tok::Comment { text, long: true };
         }
 
-        // Strings.
+        // Strings. An unterminated one ends at the end of its line, which
+        // is left for the next token so the line count stays right.
         if c == b'\'' || c == b'"' {
             let mut j = i + 1;
             let mut s = Vec::new();
-            while j < b.len() && b[j] != c {
+            while j < b.len() && b[j] != c && b[j] != b'\n' {
                 if b[j] == b'\\' && j + 1 < b.len() {
                     match b[j + 1] {
                         b'n' => s.push(b'\n'),
@@ -218,14 +219,10 @@ impl Lexer<'_> {
                     j += 2;
                     continue;
                 }
-                if b[j] == b'\n' {
-                    // Unterminated string; stop at the end of the line.
-                    break;
-                }
                 s.push(b[j]);
                 j += 1;
             }
-            self.i = (j + 1).min(b.len());
+            self.i = if b.get(j) == Some(&c) { j + 1 } else { j };
             return Tok::Str(String::from_utf8_lossy(&s).into_owned());
         }
         if let (b'[', Some(level)) = (c, long_bracket_level(b, i)) {
@@ -499,6 +496,13 @@ mod tests {
         let last = toks.last().unwrap();
         assert!(matches!(&last.tok, Tok::Number(n) if n == "1.5e-3"));
         assert_eq!(last.line, 4);
+    }
+
+    #[test]
+    fn unterminated_strings_keep_the_line_count() {
+        let toks = tokenize("x = 'open\ny = 1");
+        let y = toks.iter().find(|t| t.is_name("y")).unwrap();
+        assert_eq!((y.line, y.line_start), (2, true));
     }
 
     #[test]

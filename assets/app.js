@@ -135,7 +135,7 @@
   // Marks the current group/module and attaches the module's function list.
   function markActive() {
     if (!nav) return;
-    Array.prototype.forEach.call(nav.querySelectorAll('.sidebar-row.active, a.active'), function (el) { el.classList.remove('active'); });
+    Array.prototype.forEach.call(nav.querySelectorAll('.sidebar-row.active'), function (el) { el.classList.remove('active'); });
     var old = nav.querySelector('.sidebar-functions');
     if (old) old.parentNode.removeChild(old);
 
@@ -406,9 +406,10 @@
       hideSuggestions();
       navigate(new URL(docsRoot + 'search.html?q=' + encodeURIComponent(input.value)), true);
     });
+    // A click anywhere but the input closes the list, a picked suggestion
+    // included: its link has been followed by then.
     document.addEventListener('click', function (e) {
-      if (suggestions && !suggestions.contains(e.target) && e.target !== input) hideSuggestions();
-      else if (suggestions && suggestions.contains(e.target)) hideSuggestions();
+      if (suggestions && e.target !== input) hideSuggestions();
     });
     document.addEventListener('keydown', function (e) {
       var tag = (document.activeElement && document.activeElement.tagName) || '';

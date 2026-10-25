@@ -34,7 +34,7 @@ use std::collections::HashMap;
 use nl_syntax::{SyntaxKind as K, SyntaxNode, SyntaxToken};
 
 use crate::doc::{self, DocBlock, Param, Realm, Return};
-use crate::scanner::{new_decl, Branch, Category, ClassDecl, FileScan, HookAdd, HookCall, Sep, HOOK_CALLERS, MAX_CONDITION_LEN, MAX_SOURCE_LEN};
+use crate::scanner::{cut, new_decl, Branch, Category, ClassDecl, FileScan, HookAdd, HookCall, Sep, HOOK_CALLERS, MAX_CONDITION_LEN, MAX_SOURCE_LEN};
 
 /// NL calls that run a hook by name, and how many arguments sit between the
 /// hook name and the hook's own arguments (the gamemode table of
@@ -753,11 +753,7 @@ fn compact(node: &SyntaxNode, max: usize) -> String {
             break;
         }
     }
-    if chars > max {
-        let cut: String = out.chars().take(max).collect();
-        return format!("{}…", cut.trim_end());
-    }
-    out
+    cut(out, max)
 }
 
 /// The text of a comment line without its `##` or `#` and one space.

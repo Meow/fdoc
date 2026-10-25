@@ -188,14 +188,24 @@ fn reference_link(project: &Project, root: &str, reference: &str) -> String {
     }
 }
 
+/// `file:line`, linked to the source when a source URL is set.
 fn source_link(project: &Project, file: &str, line: usize) -> String {
+    link_to_source(project, file, &format!("{file}:{line}"), &format!("#L{line}"))
+}
+
+/// A file name, linked to the source when a source URL is set.
+fn file_link(project: &Project, file: &str) -> String {
+    link_to_source(project, file, file, "")
+}
+
+fn link_to_source(project: &Project, file: &str, text: &str, fragment: &str) -> String {
     match &project.source_url {
-        Some(base) => format!("<a class=\"source-link\" href=\"{}{}#L{line}\" title=\"View source\">{}:{line}</a>", esc(base), esc(file), esc(file)),
-        None => format!("<span class=\"source-link\">{}:{line}</span>", esc(file)),
+        Some(base) => format!("<a class=\"source-link\" href=\"{}{}{fragment}\" title=\"View source\">{}</a>", esc(base), esc(file), esc(text)),
+        None => format!("<span class=\"source-link\">{}</span>", esc(text)),
     }
 }
 
-/// The class suffix, label and tooltip of a realm.
+/// The class suffix and tooltip of a realm.
 fn realm_parts(realm: Realm) -> (&'static str, &'static str) {
     match realm {
         Realm::Server => ("server", "Server-side"),
@@ -230,7 +240,7 @@ fn split_first_paragraph(text: &str) -> (String, String) {
     }
 }
 
-fn type_html(ty: &Option<String>) -> String {
+fn type_html(ty: Option<&str>) -> String {
     match ty {
         Some(t) => format!("<span class=\"type\">{}</span>", esc(t)),
         None => String::new(),
@@ -428,7 +438,7 @@ fn module_page(project: &Project, group: &Group, m: &Module) -> String {
     if !m.files.is_empty() {
         body.push_str("<section class=\"sources\"><h2>Defined in</h2><ul>");
         for file in &m.files {
-            let _ = write!(body, "<li>{}</li>", source_link(project, file, 1).replace(":1<", "<").replace("#L1\"", "\""));
+            let _ = write!(body, "<li>{}</li>", file_link(project, file));
         }
         body.push_str("</ul></section>\n");
     }
@@ -601,7 +611,7 @@ fn arguments_list(f: &Function) -> String {
 fn returns_list(project: &Project, root: &str, returns: &[Return]) -> String {
     let mut out = String::from("<ul class=\"returns\">");
     for r in returns {
-        let _ = write!(out, "<li>{}", type_html(&r.ty));
+        let _ = write!(out, "<li>{}", type_html(r.ty.as_deref()));
         if !r.description.is_empty() {
             let _ = write!(out, " <span class=\"desc\">{}</span>", md_inline(project, root, &r.description));
         }
@@ -729,8 +739,8 @@ fn params_list(project: &Project, root: &str, params: &[crate::doc::Param]) -> S
     let mut out = String::from("<ul class=\"params\">");
     for p in params {
         let _ = write!(out, "<li><span class=\"param-name\">{}</span>", esc(&p.name));
-        if p.ty.is_some() {
-            let _ = write!(out, " {}", type_html(&p.ty));
+        if let Some(ty) = &p.ty {
+            let _ = write!(out, " {}", type_html(Some(ty)));
         }
         if let Some(d) = &p.default {
             let _ = write!(out, " <span class=\"default\">optional, defaults to <code>{}</code></span>", esc(d));
