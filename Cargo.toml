@@ -5,7 +5,7 @@ edition = "2024"
 license = "MIT"
 
 [dependencies]
-comrak = { version = "0.56.0", default-features = false }
+comrak = { version = "0.57.0", default-features = false }
 yaml-rust2 = { version = "0.13", default-features = false }
 # NL's own parser, for `.nl` and `.nlua` files.
 nl_syntax = { git = "https://github.com/nl-lang/nl" }

@@ -25,9 +25,9 @@ dependencies = [
 
 [[package]]
 name = "comrak"
-version = "0.56.0"
+version = "0.57.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2544c4d6b6da7d54e95ac2833b464bf3dffa0666237868f2bf4ec5e11c9ba8cc"
+checksum = "b5ef59c72b988dfc7c73ec58ec0dc50f95dd87d7f1f39f428902bc379cea8507"
 dependencies = [
  "caseless",
  "entities",
@@ -122,9 +122,9 @@ dependencies = [
 
 [[package]]
 name = "memchr-n"
-version = "0.1.9"
+version = "0.1.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1805571b8e7b1284ad43f27c88477840c1c0e5807c150021ac83d2228806540e"
+checksum = "f48c6352cc1185740af256ccc396af598d2366bfd90a34f5afe48744bf06a5b5"
 dependencies = [
  "fearless_simd",
  "fearless_simd_macros",
@@ -142,7 +142,7 @@ dependencies = [
 [[package]]
 name = "nl_syntax"
 version = "0.1.0"
-source = "git+https://github.com/nl-lang/nl#65121896861a39f086410720f199fdcb9a7bd943"
+source = "git+https://github.com/nl-lang/nl#d798929175fcd60f26c3d1314868e7b8e1a5d458"
 dependencies = [
  "rowan",
 ]
@@ -266,15 +266,15 @@ checksum = "33f4fe9184a62d842c9ef383018f3306d8ba224fd9d836f56d7288308847c256"
 
 [[package]]
 name = "smallvec"
-version = "1.16.2"
+version = "1.16.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f9395f0f0eee849a9b707b2f06bb92a6a422090e2123bb2ef8e87a0e61892a8e"
+checksum = "d0d5d4b1981b8bbbb7aed204cae5726d683d5d6ac7e74ec54122ea28f315e7c8"
 
 [[package]]
 name = "syn"
-version = "3.0.6"
+version = "3.0.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8593e8e72159ed2257d083c7a454a85cbf854f37a0966d8d483aff8c8a3ebcee"
+checksum = "d78c8dee4c7bf0e14673097256fed6142ce9d3b85a408189d07482442145823b"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -301,15 +301,15 @@ checksum = "6af6ae20167a9ece4bcb41af5b80f8a1f1df981f6391189ce00fd257af04126a"
 
 [[package]]
 name = "unicode-ident"
-version = "1.0.26"
+version = "1.0.27"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d245f478577f809a851594d02313b640fb437e0bb33866753cff937863096954"
+checksum = "a2c754d6c33795a1c324727428e5a7dedb5b06195f9890bdbcba760d3e246563"
 
 [[package]]
 name = "unicode-normalization"
-version = "0.1.25"
+version = "0.1.26"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5fd4f6878c9cb28d874b009da9e8d183b5abc80117c40bbd187a1fde336be6e8"
+checksum = "75cd3fb03d5288b3ba9a1ee103ac7e9cbb59f0b03d64f8ddfcc04dd42758a85d"
 dependencies = [
  "tinyvec",
 ]
