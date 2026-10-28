@@ -183,9 +183,9 @@ pub struct Function {
     /// differ from the primary definition's realm, when that one is not
     /// documented.
     pub doc_realm: Realm,
-    /// The client definition's doc of a merged twin, when it differs from
-    /// `doc`.
-    pub client_doc: Option<DocBlock>,
+    /// The docs of a merged twin's other realms that differ from `doc`,
+    /// at most one per realm, server before client.
+    pub realm_docs: Vec<(Realm, DocBlock)>,
     /// The `else` arm definition of a branch twin: a function defined in
     /// both arms of one `if` statement.
     pub otherwise: Option<Otherwise>,
@@ -226,7 +226,7 @@ impl Function {
             realm,
             sources: vec![(file.to_string(), line, realm)],
             doc_realm: realm,
-            client_doc: None,
+            realm_docs: Vec::new(),
             otherwise: None,
             callers: Vec::new(),
             hook_id: None,
@@ -1057,20 +1057,20 @@ fn add_function(m: &mut Module, f: Function) {
 
 /// Merges `f` into its twin `e`. The shared, else the server definition
 /// is the primary one. The doc of the shared, else the server, else the
-/// client definition wins, and a differing client doc is kept as
-/// `client_doc`.
+/// client definition wins, and the other realms' docs that differ from it
+/// are kept in `realm_docs`.
 fn merge_twin(e: &mut Function, mut f: Function) {
     if realm_rank(f.realm) < realm_rank(e.sources[0].2) {
         std::mem::swap(e, &mut f);
     }
-    let candidates = [(e.doc_realm, e.doc.take()), (Realm::Client, e.client_doc.take()), (f.doc_realm, f.doc.take()), (Realm::Client, f.client_doc.take())];
-    let mut docs: Vec<(Realm, DocBlock)> = candidates.into_iter().filter_map(|(r, d)| d.map(|d| (r, d))).collect();
+    let own = [(e.doc_realm, e.doc.take()), (f.doc_realm, f.doc.take())].into_iter().filter_map(|(r, d)| d.map(|d| (r, d)));
+    let mut docs: Vec<(Realm, DocBlock)> = own.chain(e.realm_docs.drain(..)).chain(f.realm_docs.drain(..)).collect();
     docs.sort_by_key(|(r, _)| realm_rank(*r));
     let mut docs = docs.into_iter();
     let (doc_realm, doc) = docs.next().map_or((e.sources[0].2, None), |(r, d)| (r, Some(d)));
     e.doc_realm = doc_realm;
+    e.realm_docs = docs.filter(|(_, d)| !doc.as_ref().is_some_and(|p| same_text(p, d))).collect();
     e.doc = doc;
-    e.client_doc = docs.find(|(r, d)| *r == Realm::Client && !e.doc.as_ref().is_some_and(|p| same_text(p, d))).map(|(_, d)| d);
     e.sources.extend(f.sources);
     e.otherwise = e.otherwise.take().or(f.otherwise);
     e.realm = Realm::Shared;
@@ -1786,15 +1786,15 @@ mod tests {
         assert_eq!((data.file.as_str(), data.line), ("core/sv_kernel.lua", 3), "the server definition is primary");
         assert_eq!(data.params, vec!["key", "default"]);
         assert_eq!(data.summary(), "Server data.");
-        assert_eq!(data.client_doc.as_ref().unwrap().summary(), "Client data.");
+        assert_eq!(data.realm_docs.iter().map(|(r, d)| (*r, d.summary())).collect::<Vec<_>>(), vec![(Realm::Client, "Client data.".to_string())]);
         assert_eq!(data.sources, vec![("core/sv_kernel.lua".to_string(), 3, Realm::Server), ("core/cl_kernel.lua".to_string(), 3, Realm::Client)]);
 
-        assert!(get("cw.core", "Same")[0].client_doc.is_none(), "identical docs are kept once");
-        assert!(get("cw.core", "IncludeSchema")[0].client_doc.is_none(), "docs differing only in @realm are identical");
+        assert!(get("cw.core", "Same")[0].realm_docs.is_empty(), "identical docs are kept once");
+        assert!(get("cw.core", "IncludeSchema")[0].realm_docs.is_empty(), "docs differing only in @realm are identical");
         assert_eq!(get("cw.core", "IncludeSchema").len(), 1);
         let undocumented = &get("cw.core", "Undocumented")[0];
         assert_eq!(undocumented.summary(), "Documented.");
-        assert!(undocumented.client_doc.is_none());
+        assert!(undocumented.realm_docs.is_empty());
         let twice = get("cw.core", "Twice");
         assert_eq!(twice.len(), 2, "definitions in the same realm are not twins");
         let anchors: Vec<&str> = twice.iter().map(|f| f.anchor.as_str()).collect();
@@ -1807,6 +1807,7 @@ mod tests {
         let table = &get("cw_item", "GetItemTable")[0];
         assert_eq!((table.realm, table.file.as_str(), table.summary().as_str()), (Realm::Shared, "entities/entities/cw_item/shared.lua", "Shared."));
         assert_eq!(table.sources.len(), 2);
+        assert_eq!(table.realm_docs.iter().map(|(r, d)| (*r, d.summary())).collect::<Vec<_>>(), vec![(Realm::Server, "Server override.".to_string())], "the server doc is kept beside the shared one");
         let think = &get("cw_item", "Think")[0];
         assert_eq!((think.realm, think.file.as_str(), think.sources.len()), (Realm::Shared, "entities/entities/cw_item/init.lua", 2));
         assert_eq!(get("cw_item", "Draw")[0].realm, Realm::Client);
@@ -1822,7 +1823,20 @@ mod tests {
         let think = &module(&modules, "cw_lamp").functions[0];
         assert_eq!((think.realm, think.file.as_str(), think.sources.len()), (Realm::Shared, "entities/entities/cw_lamp/shared.lua", 3));
         assert_eq!((think.summary(), think.doc_realm), ("Updates the lamp.".to_string(), Realm::Shared));
-        assert_eq!(think.client_doc.as_ref().map(|d| d.summary()).as_deref(), Some("Draws the glow."), "the client doc survives the later merge");
+        assert_eq!(think.realm_docs.iter().map(|(r, d)| (*r, d.summary())).collect::<Vec<_>>(), vec![(Realm::Client, "Draws the glow.".to_string())], "the client doc survives the later merge");
+    }
+
+    #[test]
+    fn keeps_the_docs_of_all_three_realms() {
+        let modules = core(vec![
+            ("entities/entities/cw_lamp/cl_init.lua", "--- Draws the glow.\nfunction ENT:Think() end"),
+            ("entities/entities/cw_lamp/init.lua", "--- Drains the battery.\nfunction ENT:Think() end"),
+            ("entities/entities/cw_lamp/shared.lua", "--- Updates the lamp.\nfunction ENT:Think() end"),
+        ]);
+        let think = &module(&modules, "cw_lamp").functions[0];
+        assert_eq!((think.summary(), think.doc_realm), ("Updates the lamp.".to_string(), Realm::Shared));
+        let others: Vec<(Realm, String)> = think.realm_docs.iter().map(|(r, d)| (*r, d.summary())).collect();
+        assert_eq!(others, vec![(Realm::Server, "Drains the battery.".to_string()), (Realm::Client, "Draws the glow.".to_string())]);
     }
 
     #[test]

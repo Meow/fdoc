@@ -485,23 +485,21 @@ fn function_detail(project: &Project, root: &str, f: &Function) -> String {
         source = source_link(project, &f.file, f.line),
     );
     out.push_str(&hook_info(project, root, f));
-    match (&f.doc, &f.client_doc) {
-        (doc, Some(client)) => {
-            let (realm, label) = match f.doc_realm {
-                Realm::Shared => ("shared", "Shared"),
-                _ => ("server", "On the server"),
-            };
-            let _ = writeln!(out, "<div class=\"realm-doc realm-doc-{realm}\"><p class=\"realm-doc-title\">{label}</p>");
-            match doc {
-                Some(doc) => out.push_str(&doc_body(project, root, doc, Some(f))),
-                None => out.push_str("<p class=\"muted\">No documentation available.</p>\n"),
+    match &f.doc {
+        Some(doc) if !f.realm_docs.is_empty() => {
+            for (realm, doc) in std::iter::once((f.doc_realm, doc)).chain(f.realm_docs.iter().map(|(r, d)| (*r, d))) {
+                let (class, label) = match realm {
+                    Realm::Shared => ("shared", "Shared"),
+                    Realm::Server => ("server", "On the server"),
+                    Realm::Client => ("client", "On the client"),
+                };
+                let _ = writeln!(out, "<div class=\"realm-doc realm-doc-{class}\"><p class=\"realm-doc-title\">{label}</p>");
+                out.push_str(&doc_body(project, root, doc, Some(f)));
+                out.push_str("</div>\n");
             }
-            out.push_str("</div>\n<div class=\"realm-doc realm-doc-client\"><p class=\"realm-doc-title\">On the client</p>\n");
-            out.push_str(&doc_body(project, root, client, Some(f)));
-            out.push_str("</div>\n");
         }
-        (Some(doc), None) => out.push_str(&doc_body(project, root, doc, Some(f))),
-        (None, None) => {
+        Some(doc) => out.push_str(&doc_body(project, root, doc, Some(f))),
+        None => {
             out.push_str("<p class=\"muted\">No documentation available.</p>\n");
             if f.kind == FunctionKind::Hook {
                 out.push_str(&arguments_list(f));

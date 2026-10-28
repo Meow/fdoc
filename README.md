@@ -218,10 +218,11 @@ free functions are listed under `Globals`.
   server-side. The marker is shown in the summary, the details, the sidebar
   and search results, and next to the title of a module that runs on one
   side only: a template, or a module whose functions all do. A function
-  defined once for the server and once for the client (such as in
-  `sv_kernel.lua` and `cl_kernel.lua`) is shown once, as shared, with both
-  definitions; when their doc comments differ, both are shown, the
-  client's under "On the client".
+  defined in more than one realm (such as in `sv_kernel.lua` and
+  `cl_kernel.lua`, or in an entity's `shared.lua` and `init.lua`) is shown
+  once, as shared, with every definition; when their doc comments differ,
+  each is shown under its realm ("Shared", "On the server", "On the
+  client").
 - **Branch twins.** A function defined in the first arm of an `if`
   statement and again in one of its `elseif` / `else` arms, for the same
   realm, such as a real implementation under
