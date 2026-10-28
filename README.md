@@ -5,7 +5,9 @@
 reference: one page per class, library, hook table, template object, Lumen
 template, NL struct, enum, interface or module, with a sidebar, full-text
 search, cross-reference links, syntax highlighted examples and a night mode.
-The output is plain files and works from disk or any static host.
+The output is plain files and works from disk or any static host. The same
+model can be written as one JSON document instead, for tools to read (see
+[JSON output](#json-output)).
 
 ## Usage
 
@@ -17,11 +19,18 @@ cargo build --release
 It reads every `.lua` file, every Lumen template (`.lumen`, see
 [below](#lumen-templates)) and every NL file (`.nl` and `.nlua`, see
 [below](#nl-files)) below the source directory. NL declaration files
-(`.d.nl`) are not read.
+(`.d.nl`) are not read. Lua files may use the syntax of Garry's Mod (`!`,
+`!=`, `&&`, `||`, `//` and `/* */` comments, `continue`) and the LuaJIT 3.0
+extensions: bit operators (`&`, `|`, `~`, `<<`, `>>`, `~>>`), `c ? a : b`,
+`a?.b`, `a?.[k]`, `a?.(...)`, `a?.:m()`, `a ?? b`, compound assignments
+(`+=`, `..=`, `~>>=`, ...), `const`, short functions (`x -> e`,
+`|a, b| -> e`, `|| -> e`, `|a| -> do ... end`), `1_000`, `\u{XXXX}` escapes
+and `;;`.
 
 | Option | Effect |
 | --- | --- |
-| `-o, --output <DIR>` | Output directory (default: `<SOURCE_DIR>/docs`) |
+| `-o, --output <DIR>` | Output directory (default: `<SOURCE_DIR>/docs`); `-` writes the JSON document to standard output |
+| `-f, --format <FORMAT>` | `html` (default) writes the pages, `json` the whole model as `<DIR>/fdoc.json` |
 | `--config <FILE>` | Layout and project settings (default: `<SOURCE_DIR>/.fdoc.yml` if it exists); see [below](#configuration) |
 | `--title <NAME>` | Project name (default: the config's `title`, else the `name` in `packagespec.lua`, else the directory name) |
 | `--source-url <URL>` | Base URL that source paths are appended to for "view source" links |
@@ -37,6 +46,13 @@ fdoc ~/code/flux-ce -o ~/code/flux-ce/docs \
   --source-url https://github.com/TeslaCloud/flux-ce/blob/master/
 ```
 
+With `--format json`, the summary goes to standard error when the document
+goes to standard output:
+
+```sh
+fdoc ~/code/flux-ce -f json -o - | jq '.sections[].groups[].modules[].id'
+```
+
 The pages are static, so they can be opened straight from disk. When they are
 served over HTTP, following a link fetches only the content column and keeps the
 sidebar in place, which makes moving between modules feel instant. Any static
@@ -45,6 +61,85 @@ server works, for example:
 ```sh
 python3 -m http.server --directory path/to/docs
 ```
+
+## JSON output
+
+`--format json` writes the model the pages are made from as one JSON
+document, `fdoc.json`. It is written in ASCII: every other character is
+escaped as `\uXXXX`. Its fields are listed below; a field marked `?` is
+`null` when there is nothing to put in it. `format_version` is raised when
+a field is renamed, removed or changes its meaning; new fields can be added
+without it.
+
+```text
+{ title, version?, summary?, description?, source_url?,
+  format_version: 1, generator: "fdoc <version>",
+  sections: [Section],
+  index: { <reference>: <page URL> } }        # how references such as `A#b` resolve
+
+Section  { title, groups: [Group] }
+
+Group    { title, path,                       # the output directory of its pages
+           source_dir,                        # its directory in the source tree
+           core: bool, description?, author?, version?,
+           realm?,                            # "server" for a server-side package
+           modules: [Module] }
+
+Module   { id, title, subtitle?,
+           kind,                              # the badge: "class", "library", "hooks", "gamemode",
+                                              # "schema", "plugin", "handlers", "globals", "object",
+                                              # "template", "module", "struct", ... or a definition
+                                              # label in lower case ("command", "entity")
+           module_kind,                       # "class", "library", "hooks", "handlers", "globals",
+                                              # "object" or "template"
+           keyword?,                          # an NL class's keyword ("struct", "enum", ...)
+           extends?,                          # the class it extends
+           object?,                           # handlers and objects: the table as written ("GM", "PANEL")
+           definition?,                       # a definition's label ("Command", "Template")
+           realm?,                            # a Lumen template's realm
+           summary, description, doc: Doc?,
+           files: [path], declared_in: { file, line }?, slug,
+           categories: [{ name, description }],
+           functions: [Function] }
+
+Function { name, owner, qualified,            # "Owner:name", "Owner.name" or "name"
+           signature,                         # qualified, with the parameters ("A:b(x, y)")
+           params: [name],                    # for a hook: its arguments, as written
+           kind,                              # "declared", "hook", "hook_add" or "value"
+           realm,                             # "shared", "server" or "client"
+           file, line,                        # the primary definition
+           sources: [{ file, line, realm }],  # every definition; a hook's call sites
+           summary, description, doc: Doc?,
+           doc_realm,                         # the realm of the definition `doc` comes from
+           realm_docs: [{ realm, summary, description, doc: Doc }],
+                                              # merged twins: the docs of the other realms
+           otherwise: { condition, file, line, summary, description, doc: Doc? }?,
+                                              # branch twins: the definition in the other arm
+           callers: [qualified],              # hooks: the functions that run it
+           hook_id?,                          # hook.Add handlers: the identifier
+           implements?,                       # hook handlers: the hook's reference ("hook:Name")
+           category, part?,
+           ty?, init?,                        # NL: the type, and what a value is given
+           anchor }                           # the fragment of its entry on the module's page
+
+Doc      { params: [{ name, type?, default?, description }],
+           returns: [{ type?, description }],
+           variants: [{ signature, description, params, returns }],
+           see: [reference], alias: [name],
+           deprecated?,                       # the reason ("" without one) when deprecated
+           deprecation_version?,
+           warning?,                          # the first warning's text
+           warnings: [{ label?, text }], internal: bool,
+           environment?, environment_text?,   # @environment's name and text
+           realm?,                            # @realm
+           category?, module?, ignored: bool,
+           examples: [{ language?, code }],   # the fenced code blocks of the description
+           tags: [{ name, text }] }           # tags fdoc does not know
+```
+
+Hooks are the functions of the `Hooks` modules (`module_kind: "hooks"`),
+with `kind: "hook"`, their call sites in `sources` and their callers in
+`callers`.
 
 ## Layout of the generated documentation
 
@@ -244,7 +339,10 @@ module's functions are in that file, so the client half of a module does
 not describe the whole. `sh_` files win over the others.
 
 Local functions are private and not documented, except the top-level ones
-of a Lumen template. In NL, top-level functions, constants and types without
+of a Lumen template. A local function is a `local function f()`, a
+`const function f()`, or a local given a short function
+(`local f = |a, b| -> ...`, `const f = x -> ...`), whose parameters are
+those of the short function. In NL, top-level functions, constants and types without
 `pub` are private.
 
 ### Lumen templates
@@ -313,10 +411,11 @@ like an NL type (`@return [the health left]`).
 
 A doc comment starts with `---` and continues on the following `--` lines. It
 documents the declaration that directly follows it: a `function`, a
-`name = function` assignment, a `class 'Name'` declaration, a top-level
-`local NAME = ...` (such as `local PANEL = {}`), a top-level
-`local function` of a Lumen template, or a statement that runs a hook
-(`hook.Run('Name', ...)`) or adds one (`hook.Add('Name', ...)`).
+`name = function` assignment or one of a short function
+(`Lib.add = |a, b| -> a + b`), a `class 'Name'` declaration, a top-level
+`local NAME = ...` or `const NAME = ...` (such as `local PANEL = {}`), a
+top-level local function of a Lumen template, or a statement that runs a
+hook (`hook.Run('Name', ...)`) or adds one (`hook.Add('Name', ...)`).
 
 In an NL file, a doc comment starts with `##` and continues on the following
 `##` or `#` lines, as for NL's own tools. It documents the declaration or

@@ -337,6 +337,9 @@ pub struct Group {
     pub version: Option<String>,
     /// Output directory relative to the docs root, e.g. `packages/flow`.
     pub dir: String,
+    /// The group's directory in the source tree, relative to the root (see
+    /// `Placement::source_dir`).
+    pub source_dir: String,
     pub modules: Vec<Module>,
     /// Core groups have no index page of their own.
     pub is_core: bool,
@@ -582,7 +585,7 @@ pub fn build(files: Vec<PlacedFile>, opts: BuildOptions) -> Project {
             dir = format!("{}-{n}", place.dir);
         }
         let realm = (!place.core && server_package(&place.source_dir, opts.packages)).then_some(Realm::Server);
-        let group = Group { title: group_title, description: gb.description, author: gb.author, version: gb.version, dir, modules, is_core: place.core, realm };
+        let group = Group { title: group_title, description: gb.description, author: gb.author, version: gb.version, dir, source_dir: place.source_dir.clone(), modules, is_core: place.core, realm };
         placed.push((place, group));
     }
     // Core groups first, then by key.

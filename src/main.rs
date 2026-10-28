@@ -1,8 +1,10 @@
-//! fdoc - generates HTML documentation from the doc comments of a Lua
-//! code base, with its Lumen templates and NL files.
+//! fdoc - generates HTML documentation, or a JSON document of the same
+//! model, from the doc comments of a Lua code base, with its Lumen
+//! templates and NL files.
 
 mod doc;
 mod html;
+mod json;
 mod layout;
 mod lexer;
 mod markdown;
@@ -13,6 +15,7 @@ mod scanner;
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -21,7 +24,7 @@ use lexer::Syntax;
 use model::{BuildOptions, PlacedFile};
 
 const USAGE: &str = "\
-fdoc - HTML documentation generator for Lua and NL doc comments
+fdoc - HTML and JSON documentation generator for Lua and NL doc comments
 
 Usage: fdoc [OPTIONS] <SOURCE_DIR>
 
@@ -29,7 +32,9 @@ Arguments:
   <SOURCE_DIR>            Directory to scan recursively for .lua, .lumen, .nl and .nlua files
 
 Options:
-  -o, --output <DIR>      Output directory (default: <SOURCE_DIR>/docs)
+  -o, --output <DIR>      Output directory (default: <SOURCE_DIR>/docs); - writes the JSON
+                          document to standard output
+  -f, --format <FORMAT>   html (default): the pages; json: the whole model as <DIR>/fdoc.json
       --config <FILE>     Layout and project settings (default: <SOURCE_DIR>/.fdoc.yml if it exists)
       --title <NAME>      Project name (default: from the config or packagespec.lua, else the directory name)
       --source-url <URL>  Base URL that source paths are appended to for \"view source\" links
@@ -42,9 +47,19 @@ Options:
   -V, --version           Print the version
 ";
 
+/// What fdoc writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Format {
+    /// The HTML pages.
+    Html,
+    /// One JSON document of the whole model, `fdoc.json`.
+    Json,
+}
+
 struct Args {
     source: PathBuf,
     output: Option<PathBuf>,
+    format: Format,
     config: Option<PathBuf>,
     title: Option<String>,
     source_url: Option<String>,
@@ -57,7 +72,7 @@ struct Args {
 fn parse_args() -> Result<Args, String> {
     let mut args = std::env::args().skip(1);
     let mut source = None;
-    let mut out = Args { source: PathBuf::new(), output: None, config: None, title: None, source_url: None, excludes: vec!["docs".into(), ".git".into()], documented_only: false, clean: false, quiet: false };
+    let mut out = Args { source: PathBuf::new(), output: None, format: Format::Html, config: None, title: None, source_url: None, excludes: vec!["docs".into(), ".git".into()], documented_only: false, clean: false, quiet: false };
 
     while let Some(a) = args.next() {
         let mut value = |name: &str| args.next().ok_or_else(|| format!("{name} requires a value"));
@@ -71,6 +86,13 @@ fn parse_args() -> Result<Args, String> {
                 std::process::exit(0);
             }
             "-o" | "--output" => out.output = Some(PathBuf::from(value("--output")?)),
+            "-f" | "--format" => {
+                out.format = match value("--format")?.as_str() {
+                    "html" => Format::Html,
+                    "json" => Format::Json,
+                    other => return Err(format!("unknown format: {other} (expected html or json)")),
+                }
+            }
             "--config" => out.config = Some(PathBuf::from(value("--config")?)),
             "--title" => out.title = Some(value("--title")?),
             "--source-url" => out.source_url = Some(value("--source-url")?),
@@ -223,6 +245,10 @@ fn run(args: Args) -> Result<(), String> {
         return Err(format!("{} is not a directory", source.display()));
     }
     let output = args.output.clone().unwrap_or_else(|| source.join("docs"));
+    let to_stdout = output.as_os_str() == "-";
+    if to_stdout && args.format != Format::Json {
+        return Err("only --format json can be written to standard output".into());
+    }
 
     let (config_path, config) = load_config(&args)?;
     if !args.quiet {
@@ -236,7 +262,7 @@ fn run(args: Args) -> Result<(), String> {
     let documented_only = args.documented_only || config.documented_only.unwrap_or(false);
     let excludes: Vec<String> = args.excludes.iter().chain(&config.exclude).cloned().collect();
 
-    let files = collect_source_files(source, &excludes, Some(&output))?;
+    let files = collect_source_files(source, &excludes, (!to_stdout).then_some(output.as_path()))?;
     if files.is_empty() {
         return Err(format!("no .lua, .lumen, .nl or .nlua files found in {}", source.display()));
     }
@@ -283,7 +309,7 @@ fn run(args: Args) -> Result<(), String> {
         },
     );
 
-    if args.clean && output.exists() {
+    if args.clean && !to_stdout && output.exists() {
         // Both exist at this point, so canonicalising only fails on a
         // permission problem; refusing is the safe answer then.
         let holds_source = match (source.canonicalize(), output.canonicalize()) {
@@ -296,24 +322,45 @@ fn run(args: Args) -> Result<(), String> {
         fs::remove_dir_all(&output).map_err(|e| format!("cannot remove {}: {e}", output.display()))?;
     }
 
-    let pages = render::render_all(&project);
-    for page in &pages {
-        let path = output.join(&page.path);
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
+    let written = match args.format {
+        Format::Html => {
+            let pages = render::render_all(&project);
+            for page in &pages {
+                let path = output.join(&page.path);
+                if let Some(parent) = path.parent() {
+                    fs::create_dir_all(parent).map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
+                }
+                fs::write(&path, &page.content).map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+            }
+            format!("Wrote {} pages to {}", pages.len(), output.display())
         }
-        fs::write(&path, &page.content).map_err(|e| format!("cannot write {}: {e}", path.display()))?;
-    }
+        Format::Json if to_stdout => {
+            std::io::stdout().write_all(json::render(&project).as_bytes()).map_err(|e| format!("cannot write to standard output: {e}"))?;
+            "Wrote the JSON document to standard output".to_string()
+        }
+        Format::Json => {
+            fs::create_dir_all(&output).map_err(|e| format!("cannot create {}: {e}", output.display()))?;
+            let path = output.join("fdoc.json");
+            fs::write(&path, json::render(&project)).map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+            format!("Wrote {}", path.display())
+        }
+    };
 
     if !args.quiet {
         let modules = project.all_modules().count();
         let functions: usize = project.all_modules().map(|(_, m)| m.functions.len()).sum();
         let documented: usize = project.all_modules().map(|(_, m)| m.functions.iter().filter(|f| f.doc.is_some()).count()).sum();
-        println!("Scanned {scanned_count} files: {modules} modules, {functions} functions ({documented} documented).");
+        let mut report = format!("Scanned {scanned_count} files: {modules} modules, {functions} functions ({documented} documented).\n");
         if skipped > 0 {
-            println!("Skipped {skipped} files that match no group of the layout.");
+            report.push_str(&format!("Skipped {skipped} files that match no group of the layout.\n"));
         }
-        println!("Wrote {} pages to {}", pages.len(), output.display());
+        report.push_str(&written);
+        // The JSON document owns standard output when it is written there.
+        if to_stdout {
+            eprintln!("{report}");
+        } else {
+            println!("{report}");
+        }
     }
     Ok(())
 }

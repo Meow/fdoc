@@ -1077,7 +1077,7 @@ mod tests {
         let s = scan_nl("## A player.\nstruct Player : Base\n  ## The name.\n  name: String\n  health: Number = 100\nend\n\n## Takes damage.\n## @param amount The damage\n## @return [the health left, Bool whether it died]\nfn Player.damage(amount: Number): (Number, Bool)\nend\n\nfn Player.+(other) end\n");
         assert_eq!((s.classes[0].name.as_str(), s.classes[0].extends.as_deref(), s.classes[0].keyword), ("Player", Some("Base"), Some("struct")));
         assert_eq!(s.classes[0].doc.as_ref().unwrap().summary(), "A player.");
-        let f: Vec<(&str, bool, Option<&str>, Option<&str>, Option<&str>)> = s.functions.iter().map(|f| (f.name.as_str(), f.value, f.ty.as_deref(), f.init.as_deref(), f.category.as_deref())).collect();
+        let f = s.functions.iter().map(|f| (f.name.as_str(), f.value, f.ty.as_deref(), f.init.as_deref(), f.category.as_deref())).collect::<Vec<_>>();
         assert_eq!(f, vec![("name", true, Some("String"), None, Some("Fields")), ("health", true, Some("Number"), Some("100"), Some("Fields")), ("damage", false, Some("(Number, Bool)"), None, Some("Methods")), ("+", false, None, None, Some("Operators"))]);
         assert_eq!(s.functions[0].doc.as_ref().unwrap().summary(), "The name.");
         let damage = s.functions[2].doc.as_ref().unwrap();
@@ -1119,9 +1119,9 @@ mod tests {
         assert_eq!(f.doc.as_ref().unwrap().summary(), "Adds the hook.");
         assert_eq!(s.fields, vec![("PLUGIN".to_string(), "name".to_string(), "Admin".to_string())]);
         assert_eq!(s.plugin_author.as_deref(), Some("Me"));
-        let adds: Vec<(&str, Option<&str>, Vec<String>, Option<String>)> = s.hook_adds.iter().map(|a| (a.name.as_str(), a.id.as_deref(), a.params.clone(), a.doc.as_ref().map(|d| d.summary()))).collect();
+        let adds = s.hook_adds.iter().map(|a| (a.name.as_str(), a.id.as_deref(), a.params.clone(), a.doc.as_ref().map(|d| d.summary()))).collect::<Vec<_>>();
         assert_eq!(adds, vec![("PlayerSpawn", Some("items.spawn"), vec!["ply: Player".to_string()], Some("Hands out items.".to_string())), ("Think", Some("x"), vec!["dt".to_string()], None)]);
-        let calls: Vec<(&str, Vec<String>, Option<&str>, Option<String>)> = s.hook_calls.iter().map(|c| (c.name.as_str(), c.args.clone(), c.caller.as_deref(), c.doc.as_ref().map(|d| d.summary()))).collect();
+        let calls = s.hook_calls.iter().map(|c| (c.name.as_str(), c.args.clone(), c.caller.as_deref(), c.doc.as_ref().map(|d| d.summary()))).collect::<Vec<_>>();
         assert_eq!(
             calls,
             vec![

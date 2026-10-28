@@ -1,5 +1,9 @@
-//! A small tokenizer for Lua source (including the GLua extensions: `!`,
-//! `!=`, `&&`, `||`, `//` and `/* */` comments, `continue`).
+//! A small tokenizer for Lua source, including the GLua extensions (`!`,
+//! `!=`, `&&`, `||`, `//` and `/* */` comments, `continue`) and the LuaJIT
+//! ones: bit operators (`&`, `|`, `~`, `<<`, `>>`, `~>>`), `c ? a : b`,
+//! safe navigation (`?.`), `??`, compound assignments (`+=`, `..=`, ...,
+//! lexed as the operator followed by `=`), `const`, short functions
+//! (`|a, b| -> e`), `_` in numbers and `\u{XXXX}` escapes.
 //!
 //! The tokenizer only needs to be precise enough to find declarations and
 //! the comments attached to them, so it does not validate the source.
@@ -19,8 +23,9 @@ pub enum Tok {
     /// Punctuation / operator.
     Sym(String),
     /// An element of a Lumen template, by its tag name (empty for a
-    /// fragment). The tokens of the Lua code in its splices follow it.
-    Markup(String),
+    /// fragment). The tokens of the Lua code in its splices follow it, up
+    /// to the token at index `end`.
+    Markup { tag: String, end: usize },
 }
 
 #[derive(Debug, Clone)]
@@ -207,16 +212,7 @@ impl Lexer<'_> {
             let mut s = Vec::new();
             while j < b.len() && b[j] != c && b[j] != b'\n' {
                 if b[j] == b'\\' && j + 1 < b.len() {
-                    match b[j + 1] {
-                        b'n' => s.push(b'\n'),
-                        b't' => s.push(b'\t'),
-                        b'\n' => {
-                            s.push(b'\n');
-                            self.line += 1;
-                        }
-                        other => s.push(other),
-                    }
-                    j += 2;
+                    j = self.escape(j + 1, &mut s);
                     continue;
                 }
                 s.push(b[j]);
@@ -233,10 +229,17 @@ impl Lexer<'_> {
             return Tok::Str(text);
         }
 
-        // Numbers.
+        // Numbers, with `_` allowed between the digits (`1_000`, `0x_FF`).
+        // An exponent takes a sign: `e` in decimal numbers, `p` in hex ones.
         if c.is_ascii_digit() || (c == b'.' && b.get(i + 1).is_some_and(|d| d.is_ascii_digit())) {
+            let digits = b[i..].iter().position(|&d| d != b'0' && d != b'_').map_or(b.len(), |p| i + p);
+            let exponent = if c == b'0' && digits > i && b.get(digits).is_some_and(|x| x | 0x20 == b'x') { b'p' } else { b'e' };
+            let mut last = c;
             let mut j = i + 1;
-            while j < b.len() && (b[j].is_ascii_alphanumeric() || b[j] == b'.' || ((b[j] == b'-' || b[j] == b'+') && matches!(b[j - 1], b'e' | b'E' | b'p' | b'P'))) {
+            while j < b.len() && (b[j].is_ascii_alphanumeric() || b[j] == b'.' || b[j] == b'_' || ((b[j] == b'-' || b[j] == b'+') && last | 0x20 == exponent)) {
+                if b[j] != b'_' {
+                    last = b[j];
+                }
                 j += 1;
             }
             self.i = j;
@@ -254,7 +257,7 @@ impl Lexer<'_> {
         }
 
         // Symbols, longest match first.
-        const SYMS: [&str; 15] = ["...", "..", "==", "~=", "!=", "<=", ">=", "&&", "||", "::", "<<", ">>", "//", "=>", "->"];
+        const SYMS: [&str; 18] = ["...", "~>>", "..", "==", "~=", "!=", "<=", ">=", "&&", "||", "::", "<<", ">>", "//", "=>", "->", "?.", "??"];
         let rest = &self.src[i..];
         let sym = match SYMS.into_iter().find(|s| rest.starts_with(s)) {
             Some(s) => s.to_string(),
@@ -262,6 +265,76 @@ impl Lexer<'_> {
         };
         self.i += sym.len();
         Tok::Sym(sym)
+    }
+
+    /// Decodes the escape sequence of a string whose character after the
+    /// backslash is at `j` into `s`, as Lua and LuaJIT do: `\n` and the other
+    /// letters, `\xXX`, `\ddd`, `\u{XXXX}` (as UTF-8), `\z` (which skips the
+    /// whitespace after it) and an escaped line break. Returns the index
+    /// after the sequence. Malformed escapes keep their characters.
+    fn escape(&mut self, j: usize, s: &mut Vec<u8>) -> usize {
+        let b = self.b;
+        let hex = |k: usize| b.get(k).and_then(|&h| (h as char).to_digit(16));
+        match b[j] {
+            b'a' => s.push(0x07),
+            b'b' => s.push(0x08),
+            b'f' => s.push(0x0c),
+            b'n' => s.push(b'\n'),
+            b'r' => s.push(b'\r'),
+            b't' => s.push(b'\t'),
+            b'v' => s.push(0x0b),
+            b'\n' => {
+                s.push(b'\n');
+                self.line += 1;
+            }
+            b'\r' => {
+                s.push(b'\n');
+                self.line += 1;
+                if b.get(j + 1) == Some(&b'\n') {
+                    return j + 2;
+                }
+            }
+            b'x' => {
+                if let (Some(h), Some(l)) = (hex(j + 1), hex(j + 2)) {
+                    s.push((h * 16 + l) as u8);
+                    return j + 3;
+                }
+                s.push(b'x');
+            }
+            b'u' if b.get(j + 1) == Some(&b'{') => {
+                let mut k = j + 2;
+                let mut code = 0u32;
+                while let Some(d) = hex(k).filter(|_| code < 0x110000) {
+                    code = code * 16 + d;
+                    k += 1;
+                }
+                match char::from_u32(code).filter(|_| k > j + 2 && b.get(k) == Some(&b'}')) {
+                    Some(ch) => {
+                        s.extend_from_slice(ch.encode_utf8(&mut [0; 4]).as_bytes());
+                        return k + 1;
+                    }
+                    None => s.push(b'u'),
+                }
+            }
+            b'z' => {
+                let mut k = j + 1;
+                while k < b.len() && b[k].is_ascii_whitespace() {
+                    if b[k] == b'\n' {
+                        self.line += 1;
+                    }
+                    k += 1;
+                }
+                return k;
+            }
+            d if d.is_ascii_digit() => {
+                let len = b[j..].iter().take(3).take_while(|c| c.is_ascii_digit()).count();
+                let value = self.src[j..j + len].parse::<u32>().unwrap_or(0);
+                s.push(value.min(255) as u8);
+                return j + len;
+            }
+            other => s.push(other),
+        }
+        j + 1
     }
 
     /// True when a Lumen element starts at the current position: a `<`
@@ -284,9 +357,14 @@ impl Lexer<'_> {
         } else {
             self.markup_name()
         };
-        self.out.push(Token { tok: Tok::Markup(tag), line, line_start });
+        let index = self.out.len();
+        self.out.push(Token { tok: Tok::Markup { tag, end: 0 }, line, line_start });
         if fragment || self.attributes() {
             self.children();
+        }
+        let after = self.out.len();
+        if let Tok::Markup { end, .. } = &mut self.out[index].tok {
+            *end = after;
         }
     }
 
@@ -419,7 +497,7 @@ pub fn is_keyword(name: &str) -> bool {
 pub fn ends_operand(tok: &Tok) -> bool {
     match tok {
         Tok::Name(n) => !is_keyword(n) || matches!(n.as_str(), "end" | "nil" | "true" | "false"),
-        Tok::Str(_) | Tok::Number(_) | Tok::Markup(_) => true,
+        Tok::Str(_) | Tok::Number(_) | Tok::Markup { .. } => true,
         Tok::Sym(s) => matches!(s.as_str(), ")" | "]" | "}" | "..."),
         Tok::Comment { .. } => false,
     }
@@ -516,6 +594,48 @@ mod tests {
         assert_eq!(toks.last().unwrap().line, 3);
     }
 
+    #[test]
+    fn tokenizes_luajit_operators() {
+        let ops = |src: &str| texts(&tokenize(src));
+        assert_eq!(ops("x = a & b | ~c << 1 >> 2 ~>> 3 ~ d"), ["x", "=", "a", "&", "b", "|", "~", "c", "<<", "1", ">>", "2", "~>>", "3", "~", "d"]);
+        assert_eq!(ops("y = c ? a : b ?? d"), ["y", "=", "c", "?", "a", ":", "b", "??", "d"]);
+        assert_eq!(ops("a?.b, a?.[k], a?.(1), a?.:m()"), ["a", "?.", "b", ",", "a", "?.", "[", "k", "]", ",", "a", "?.", "(", "1", ")", ",", "a", "?.", ":", "m", "(", ")"]);
+        assert_eq!(ops("f = |a, b| -> a; g = || -> 1;; h = x -> x"), ["f", "=", "|", "a", ",", "b", "|", "->", "a", ";", "g", "=", "||", "->", "1", ";", ";", "h", "=", "x", "->", "x"]);
+        assert_eq!(ops("const x = 1 const function f() end"), ["const", "x", "=", "1", "const", "function", "f", "(", ")", "end"]);
+        assert!(!is_keyword("const"), "`const` is a soft keyword");
+    }
+
+    #[test]
+    fn tokenizes_compound_assignments() {
+        let ops = |src: &str| texts(&tokenize(src));
+        let compound = ["+", "-", "*", "/", "%", "..", "&", "|", "<<", ">>", "~>>"];
+        for op in compound {
+            assert_eq!(ops(&format!("t.x {op}= 1")), ["t", ".", "x", op, "=", "1"], "{op}=");
+        }
+        assert_eq!(ops("x ~= 1"), ["x", "~=", "1"], "xor assignment is the `~=` token");
+        assert_eq!(ops("x <<= 1 >>= 2"), ["x", "<<", "=", "1", ">>", "=", "2"]);
+    }
+
+    #[test]
+    fn tokenizes_luajit_numbers() {
+        let numbers = |src: &str| texts(&tokenize(src));
+        assert_eq!(numbers("1_000 0x_FF 0xff_ff 1_0.5_0 1e+5 1.5E-3 0x1p-4 .5"), ["1_000", "0x_FF", "0xff_ff", "1_0.5_0", "1e+5", "1.5E-3", "0x1p-4", ".5"]);
+        assert_eq!(numbers("0xE+1 0x1e-2"), ["0xE", "+", "1", "0x1e", "-", "2"], "hex numbers take a sign after `p` only");
+        assert_eq!(numbers("1ULL 0x10LL 3i"), ["1ULL", "0x10LL", "3i"]);
+    }
+
+    #[test]
+    fn decodes_string_escapes() {
+        let strings = |src: &str| tokenize(src).iter().filter_map(|t| t.string().map(str::to_string)).collect::<Vec<_>>();
+        assert_eq!(strings(r"x = '\u{48}\u{e9}\u{20AC}\u{1F600}'"), ["Hé€😀"]);
+        assert_eq!(strings(r"x = '\x41\66\0677\a\r\v\'\\'"), ["ABC7\u{7}\r\u{b}'\\"]);
+        assert_eq!(strings(r"x = '\u{110000}' .. '\q'"), ["u{110000}", "q"], "malformed escapes keep their characters");
+        let toks = tokenize("x = 'a\\z\n\n   b' .. \"c\\\nd\"\ny = 1");
+        assert_eq!(toks.iter().filter_map(|t| t.string()).collect::<Vec<_>>(), ["ab", "c\nd"]);
+        let y = toks.iter().find(|t| t.is_name("y")).unwrap();
+        assert_eq!((y.line, y.line_start), (5, true), "`\\z` and escaped line breaks count their lines");
+    }
+
     fn lumen(src: &str) -> Vec<Token> {
         tokenize_as(src, Syntax::Lumen)
     }
@@ -527,7 +647,7 @@ mod tests {
             .filter_map(|t| match &t.tok {
                 Tok::Name(s) | Tok::Number(s) | Tok::Sym(s) => Some(s.clone()),
                 Tok::Str(s) => Some(format!("'{s}'")),
-                Tok::Markup(tag) => Some(format!("<{tag}>")),
+                Tok::Markup { tag, .. } => Some(format!("<{tag}>")),
                 Tok::Comment { .. } => None,
             })
             .collect()
@@ -561,7 +681,7 @@ function after() end",
 
     #[test]
     fn tells_markup_from_comparisons() {
-        let markup = |src: &str| lumen(src).iter().filter(|t| matches!(t.tok, Tok::Markup(_))).count();
+        let markup = |src: &str| lumen(src).iter().filter(|t| matches!(t.tok, Tok::Markup { .. })).count();
         assert_eq!(markup("if a < b and #list < 3 and f(x)<y and t[1] <z and 'a' < 'b' and 1 <c then end"), 0);
         assert_eq!(markup("x = a <= b or a << b or a < (b) or a < 1"), 0);
         assert_eq!(markup("return <view/>"), 1);
@@ -585,6 +705,17 @@ function after() end",
         );
         let lines: Vec<usize> = toks.iter().filter(|t| t.is_name("end") || t.is_name("local")).map(|t| t.line).collect();
         assert_eq!(lines, [1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn marks_where_markup_ends() {
+        let toks = lumen("x = |p| -> <view a={p.a}>{p.b}<text/></view>\ny = 1");
+        let (index, end) = toks.iter().enumerate().find_map(|(i, t)| match &t.tok {
+            Tok::Markup { tag, end } if tag == "view" => Some((i, *end)),
+            _ => None,
+        }).unwrap();
+        assert_eq!(texts(&toks[index + 1..end]), ["p", ".", "a", "p", ".", "b", "<text>"], "the splices and children of the element");
+        assert!(toks[end].is_name("y"));
     }
 
     #[test]
