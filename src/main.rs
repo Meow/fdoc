@@ -221,8 +221,14 @@ fn run(args: Args) -> Result<(), String> {
         fdoc::Error::NoSourceFiles => format!("no .lua, .lumen, .nl or .nlua files found in {}", source.display()),
         fdoc::Error::NoFilesInLayout { total } => format!("none of the {total} source files in {} matches a group of the layout", source.display()),
         fdoc::Error::Read(message) => message,
+        e @ fdoc::Error::InvalidPath(_) => e.to_string(),
     })?;
     let stats = generated.stats;
+    if !args.quiet {
+        for warning in &generated.warnings {
+            eprintln!("warning: {warning}");
+        }
+    }
 
     if args.clean && !to_stdout && output.exists() {
         // Both exist at this point, so canonicalising only fails on a

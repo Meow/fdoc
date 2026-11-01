@@ -10,18 +10,19 @@
 //! ```
 //!
 //! The host allocates `in_len` bytes with `fdoc_alloc`, writes the UTF-8
-//! JSON input there (see [`crate::input_from_json`]), calls
-//! `fdoc_generate`, reads `*out_len` bytes of JSON output at the returned
-//! pointer, and frees both buffers with `fdoc_free` and the lengths they
-//! were made with. The output is `{ "pages": [...], "warnings": [...] }` or
-//! `{ "error": "..." }`.
+//! JSON input there (see [`crate::input_from_json`]), allocates 4 bytes for
+//! `out_len`, calls `fdoc_generate`, reads `*out_len` bytes of JSON output
+//! at the returned pointer, and frees every buffer with `fdoc_free` and the
+//! length it was made with. The output is `{ "pages": [...], "warnings":
+//! [...] }` or `{ "error": "..." }`. `fdoc_generate` returns null, and
+//! writes nothing, when `out_len` is null.
 //!
-//! A panic never crosses the boundary as an unwind: `fdoc_generate` catches
-//! it and answers `{ "error": ... }`. `wasm32-unknown-unknown` builds with
-//! `panic = "abort"` unless std is rebuilt with unwinding, and then a panic
-//! traps instead (a `WebAssembly.RuntimeError` in the host); the panic hook
-//! has already stored the message for `fdoc_last_panic`, and the host must
-//! drop the instance, whose state is no longer trustworthy.
+//! Panics: `wasm32-unknown-unknown` builds with `panic = "abort"`, so a
+//! panic cannot be caught and never unwinds across the boundary; it traps
+//! (a `WebAssembly.RuntimeError` in the host). Every export installs a panic
+//! hook first, which stores the message for `fdoc_last_panic`. After a trap
+//! the host should read that message and then drop the instance, whose
+//! state is no longer trustworthy.
 //!
 //! The module imports nothing.
 
@@ -36,6 +37,7 @@ thread_local! {
 
 static HOOK: Once = Once::new();
 
+/// Installs the panic hook that records the message; called by every export.
 fn install_hook() {
     HOOK.call_once(|| {
         panic::set_hook(Box::new(|info| {
@@ -55,6 +57,7 @@ fn install_hook() {
 /// A zero length gives a dangling, non-null pointer that needs no freeing.
 #[unsafe(no_mangle)]
 pub extern "C" fn fdoc_alloc(len: u32) -> *mut u8 {
+    install_hook();
     let mut buf = std::mem::ManuallyDrop::new(Vec::<u8>::with_capacity(len as usize));
     buf.as_mut_ptr()
 }
@@ -66,6 +69,7 @@ pub extern "C" fn fdoc_alloc(len: u32) -> *mut u8 {
 /// `ptr` and `len` must be a pointer and the length it was allocated with.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fdoc_free(ptr: *mut u8, len: u32) {
+    install_hook();
     if ptr.is_null() || len == 0 {
         return;
     }
@@ -74,47 +78,46 @@ pub unsafe extern "C" fn fdoc_free(ptr: *mut u8, len: u32) {
     unsafe { drop(Vec::from_raw_parts(ptr, 0, len as usize)) };
 }
 
-/// Moves `s` to a buffer the host frees with `fdoc_free(ptr, len)`.
+/// Moves `s` to a buffer the host frees with `fdoc_free(ptr, *out_len)`.
 fn into_raw(s: String, out_len: *mut u32) -> *mut u8 {
     // A boxed slice has exactly `len` bytes of capacity.
     let bytes = Box::into_raw(s.into_bytes().into_boxed_slice());
-    if !out_len.is_null() {
-        // SAFETY: the caller passes a writable `u32` in this module's memory.
-        unsafe { *out_len = bytes.len() as u32 };
-    }
+    // SAFETY: `fdoc_generate` checked that `out_len` is not null; the caller
+    // passes a writable `u32` in this module's memory.
+    unsafe { *out_len = bytes.len() as u32 };
     bytes.cast::<u8>()
 }
 
 /// Generates documentation from the JSON input at `in_ptr`; see the module
-/// documentation.
+/// documentation. Returns null if `out_len` is null.
 ///
 /// # Safety
 ///
-/// `in_ptr` must point to `in_len` readable bytes and `out_len` to a
-/// writable `u32`.
+/// `in_ptr` must point to `in_len` readable bytes, and `out_len` must be
+/// null or point to a writable `u32`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fdoc_generate(in_ptr: *const u8, in_len: u32, out_len: *mut u32) -> *mut u8 {
     install_hook();
+    if out_len.is_null() {
+        return std::ptr::null_mut();
+    }
     let input: &[u8] = if in_ptr.is_null() || in_len == 0 {
         &[]
     } else {
         // SAFETY: guaranteed by the caller.
         unsafe { std::slice::from_raw_parts(in_ptr, in_len as usize) }
     };
-    let result = panic::catch_unwind(|| match std::str::from_utf8(input) {
+    let json = match std::str::from_utf8(input) {
         Ok(text) => crate::generate_json(text),
         Err(e) => crate::error_to_json(&format!("invalid input: not UTF-8: {e}")),
-    });
-    let json = result.unwrap_or_else(|payload| {
-        let message = payload.downcast_ref::<&str>().map(|s| s.to_string()).or_else(|| payload.downcast_ref::<String>().cloned()).unwrap_or_else(|| "unknown panic".into());
-        crate::error_to_json(&format!("fdoc panicked: {message}"))
-    });
+    };
     into_raw(json, out_len)
 }
 
 /// The crate version, NUL-terminated.
 #[unsafe(no_mangle)]
 pub extern "C" fn fdoc_version() -> *const u8 {
+    install_hook();
     concat!(env!("CARGO_PKG_VERSION"), "\0").as_ptr()
 }
 

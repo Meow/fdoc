@@ -103,10 +103,23 @@ pub fn lua_name(name: &str) -> std::borrow::Cow<'_, str> {
 /// `{ }` splices (attribute values, `{...spread}` and child expressions) in
 /// source order. Tag and attribute names, quoted attribute values, text and
 /// `<!-- -->` comments produce no tokens.
+#[cfg(test)]
 pub fn tokenize_as(src: &str, syntax: Syntax) -> Vec<Token> {
-    let mut lexer = Lexer { src, b: src.as_bytes(), i: 0, line: 1, line_start: true, lumen: syntax == Syntax::Lumen, out: Vec::new() };
+    tokenize_checked(src, syntax).0
+}
+
+/// How deep Lumen elements may nest before the lexer stops descending into
+/// them; elements deeper than this are read as text. The lexer recurses per
+/// level, so without a limit a deep enough template overflows the stack.
+pub const MAX_MARKUP_DEPTH: usize = 256;
+
+/// `tokenize_as`, plus a warning when markup nested deeper than
+/// `MAX_MARKUP_DEPTH`.
+pub fn tokenize_checked(src: &str, syntax: Syntax) -> (Vec<Token>, Option<String>) {
+    let mut lexer = Lexer { src, b: src.as_bytes(), i: 0, line: 1, line_start: true, lumen: syntax == Syntax::Lumen, out: Vec::new(), depth: 0, too_deep: None };
     lexer.lua(false);
-    lexer.out
+    let warning = lexer.too_deep.map(|line| format!("line {line}: markup nests deeper than {MAX_MARKUP_DEPTH} elements; the deeper ones are read as text"));
+    (lexer.out, warning)
 }
 
 struct Lexer<'a> {
@@ -120,6 +133,10 @@ struct Lexer<'a> {
     /// The source is a Lumen template, so `<` can start markup.
     lumen: bool,
     out: Vec<Token>,
+    /// Elements open around the current position.
+    depth: usize,
+    /// The line where markup first went past `MAX_MARKUP_DEPTH`.
+    too_deep: Option<usize>,
 }
 
 impl Lexer<'_> {
@@ -349,6 +366,18 @@ impl Lexer<'_> {
     /// skipped as far as it goes.
     fn element(&mut self) {
         let (line, line_start) = (self.line, self.line_start);
+        if self.depth >= MAX_MARKUP_DEPTH {
+            // Too deep: the `<` is text, and so is what follows it.
+            self.too_deep.get_or_insert(line);
+            self.skip(1);
+            return;
+        }
+        self.depth += 1;
+        self.element_inner(line, line_start);
+        self.depth -= 1;
+    }
+
+    fn element_inner(&mut self, line: usize, line_start: bool) {
         self.skip(1);
         let fragment = self.peek(0) == Some(b'>');
         let tag = if fragment {

@@ -300,8 +300,83 @@ pub struct Config {
     pub warnings: Vec<String>,
 }
 
+/// How deep YAML collections may nest. yaml-rust2 builds and drops nested
+/// values recursively, so a deep enough document overflows the stack (a
+/// trap in the WebAssembly build); fdoc's files nest a handful of levels.
+pub const MAX_YAML_DEPTH: usize = 64;
+
+/// Refuses YAML that nests deeper than `MAX_YAML_DEPTH`, before it reaches
+/// the parser. The count is conservative: block levels by indentation (and
+/// compact `- ` / `? ` indicators), plus flow `[` and `{` outside quotes and
+/// comments; the contents of block scalars (`|`, `>`) are skipped.
+pub fn check_yaml_depth(text: &str) -> Result<(), String> {
+    let too_deep = || Err(format!("the YAML nests deeper than {MAX_YAML_DEPTH} levels"));
+    let mut indents: Vec<usize> = Vec::new();
+    let mut flow = 0usize;
+    // Inside a block scalar: the indentation of the line that opened it.
+    let mut scalar_of: Option<usize> = None;
+    for line in text.lines() {
+        let content = line.trim_start_matches(' ');
+        let indent = line.len() - content.len();
+        if let Some(open) = scalar_of {
+            if content.trim().is_empty() || indent > open {
+                continue;
+            }
+            scalar_of = None;
+        }
+        if content.trim().is_empty() || content.starts_with('#') {
+            continue;
+        }
+        if flow == 0 {
+            while indents.last().is_some_and(|&i| i >= indent) {
+                indents.pop();
+            }
+            indents.push(indent);
+        }
+        let mut rest = content;
+        let mut compact = 0;
+        while let Some(r) = rest.strip_prefix("- ").or_else(|| rest.strip_prefix("? ")).or_else(|| rest.strip_prefix("-\t")) {
+            compact += 1;
+            rest = r.trim_start();
+        }
+        if indents.len() + compact + flow > MAX_YAML_DEPTH {
+            return too_deep();
+        }
+        let mut quote: Option<char> = None;
+        let mut prev = ' ';
+        for ch in rest.chars() {
+            match quote {
+                Some(q) => {
+                    if ch == q {
+                        quote = None;
+                    }
+                }
+                None => match ch {
+                    '\'' | '"' => quote = Some(ch),
+                    '#' if prev == ' ' || prev == '\t' => break,
+                    '[' | '{' => {
+                        flow += 1;
+                        if indents.len() + compact + flow > MAX_YAML_DEPTH {
+                            return too_deep();
+                        }
+                    }
+                    ']' | '}' => flow = flow.saturating_sub(1),
+                    _ => {}
+                },
+            }
+            prev = ch;
+        }
+        let trimmed = rest.split(" #").next().unwrap_or("").trim_end();
+        if flow == 0 && (trimmed.ends_with('|') || trimmed.ends_with('>') || trimmed.ends_with("|-") || trimmed.ends_with(">-") || trimmed.ends_with("|+") || trimmed.ends_with(">+")) {
+            scalar_of = Some(indent);
+        }
+    }
+    Ok(())
+}
+
 impl Config {
     pub fn from_yaml(text: &str) -> Result<Config, String> {
+        check_yaml_depth(text)?;
         let docs = YamlLoader::load_from_str(text).map_err(|e| e.to_string())?;
         let mut config = Config::default();
         let root = match docs.into_iter().next() {
@@ -420,6 +495,7 @@ fn group(v: &Yaml, at: &str, warnings: &mut Vec<String>) -> Result<GroupSpec, St
 /// Reads a Flux-style `plugin.yml`: a mapping with `name`, `description`,
 /// `author` and `version`. Other keys are ignored.
 pub fn parse_plugin_yml(text: &str) -> Result<GroupMeta, String> {
+    check_yaml_depth(text)?;
     let docs = YamlLoader::load_from_str(text).map_err(|e| e.to_string())?;
     let mut meta = GroupMeta::default();
     let root = match docs.into_iter().next() {
@@ -667,5 +743,21 @@ sections:
         assert_eq!(meta, GroupMeta { name: Some("Extra Voices".into()), description: Some("Adds voices; and more.".into()), author: Some("kurozael".into()), version: Some("0.93".into()) });
         let meta = parse_plugin_ini("[Other]\nname=\"No\"\n[plugin]\nname = Yes ;\nversion=\"2\"\ncompatibility=\"1\"");
         assert_eq!((meta.name.as_deref(), meta.version.as_deref()), (Some("Yes"), Some("2")));
+    }
+
+    #[test]
+    fn refuses_deep_yaml_cleanly() {
+        let block: String = (0..5000).map(|i| format!("{}a{i}:\n", " ".repeat(i))).collect();
+        assert!(Config::from_yaml(&block).unwrap_err().contains("deeper than 64"));
+        assert!(parse_plugin_yml(&block).unwrap_err().contains("deeper than 64"));
+        let seq = "- ".repeat(5000) + "x\n";
+        assert!(Config::from_yaml(&seq).unwrap_err().contains("deeper than 64"));
+        let flow = format!("a: {}\n", "[".repeat(5000));
+        assert!(Config::from_yaml(&flow).unwrap_err().contains("deeper than 64"));
+        // Ordinary nesting, block scalars and brackets in quotes or comments are fine.
+        let ok: String = (0..40).map(|i| format!("{}a{i}:\n", " ".repeat(i))).collect::<String>() + &" ".repeat(40) + "x: 1\n";
+        assert!(check_yaml_depth(&ok).is_ok());
+        let text = format!("description: |\n{}\ntitle: '[[[[' # {{{{{{\n", (0..100).map(|i| format!("  {}code", " ".repeat(i))).collect::<Vec<_>>().join("\n"));
+        assert!(check_yaml_depth(&text).is_ok(), "{text}");
     }
 }

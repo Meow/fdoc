@@ -496,7 +496,9 @@ fdoc is also a library. `fdoc::generate(Input) -> Result<Output, Error>`
 takes the files of a source tree in memory (paths relative to its root and
 their text, with an optional title, version, source URL and parsed
 `.fdoc.yml`) and returns the pages (`path` and `content`) the command line
-tool would write, or the one `fdoc.json` with `Format::Json`. The command
+tool would write, or the one `fdoc.json` with `Format::Json`. The output
+does not depend on the order of the files (they are sorted by path), and
+paths with `..` components or absolute paths are refused. The command
 line tool is a directory walker around it. See the documentation comments
 in `src/lib.rs` for which files are read for metadata (`packagespec.lua`,
 `plugin.yml`, `plugin.ini`).

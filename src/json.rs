@@ -403,7 +403,7 @@ impl Parser<'_> {
     }
 
     fn value(&mut self, depth: usize) -> Result<Value, String> {
-        if depth > MAX_DEPTH {
+        if depth >= MAX_DEPTH {
             return Err(self.err("nesting too deep"));
         }
         match self.s.get(self.i) {
@@ -493,6 +493,10 @@ impl Parser<'_> {
 
     fn hex4(&mut self) -> Result<u32, String> {
         let hex = self.s.get(self.i..self.i + 4).ok_or_else(|| self.err("short \\u escape"))?;
+        // `from_str_radix` would also take a sign.
+        if !hex.iter().all(u8::is_ascii_hexdigit) {
+            return Err(self.err("invalid \\u escape"));
+        }
         let hex = std::str::from_utf8(hex).map_err(|_| self.err("invalid \\u escape"))?;
         let n = u32::from_str_radix(hex, 16).map_err(|_| self.err("invalid \\u escape"))?;
         self.i += 4;
@@ -709,6 +713,12 @@ mod tests {
             assert!(parse(bad).is_err(), "{bad}");
         }
         assert!(parse(&"[".repeat(300)).is_err());
+        // 256 levels nest, 257 do not.
+        assert!(parse(&format!("{}{}", "[".repeat(256), "]".repeat(256))).is_ok());
+        assert!(parse(&format!("{}{}", "[".repeat(257), "]".repeat(257))).is_err());
+        for bad in ["\"\\u+04a\"", "\"\\u-04a\"", "\"\\u 04a\""] {
+            assert!(parse(bad).is_err(), "{bad}");
+        }
         let mut s = String::new();
         escape("d\u{e9}j\u{e0} \u{1F600} \"q\"", &mut s);
         assert_eq!(parse(&s).unwrap(), Value::Str("d\u{e9}j\u{e0} \u{1F600} \"q\"".into()));

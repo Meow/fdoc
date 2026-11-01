@@ -8,7 +8,7 @@ use std::ops::Range;
 
 pub use crate::doc::Realm;
 use crate::doc::{self, DocBlock};
-use crate::lexer::{ends_operand, is_keyword, lua_name, tokenize_as, Syntax, Tok, Token};
+use crate::lexer::{ends_operand, is_keyword, lua_name, tokenize_checked, Syntax, Tok, Token};
 
 /// Calls that run a hook by name: the callee path as written, and how many
 /// arguments sit between the hook name and the hook's own arguments (the
@@ -165,6 +165,8 @@ pub struct HookAdd {
 
 #[derive(Debug, Clone, Default)]
 pub struct FileScan {
+    /// Problems that did not stop the scan, such as markup nested too deep.
+    pub warnings: Vec<String>,
     pub functions: Vec<FunctionDecl>,
     pub classes: Vec<ClassDecl>,
     /// `local x = FindMetaTable('Y')` style aliases: (x, Y).
@@ -327,8 +329,8 @@ pub fn scan_file(src: &str, path: &str) -> FileScan {
 /// Scans Lua source, or a Lumen template, in which markup counts as an
 /// expression. NL source goes through `scan_file`.
 pub fn scan_as(src: &str, syntax: Syntax) -> FileScan {
-    let toks = tokenize_as(src, syntax);
-    let mut s = Scanner { out: FileScan::default(), stack: Vec::new(), category: None, held: None, seen_decl: false };
+    let (toks, warning) = tokenize_checked(src, syntax);
+    let mut s = Scanner { out: FileScan { warnings: warning.into_iter().collect(), ..FileScan::default() }, stack: Vec::new(), category: None, held: None, seen_decl: false };
 
     // Pending doc block: raw comment texts and the line of the last one.
     let mut pending: Vec<String> = Vec::new();

@@ -124,9 +124,10 @@ pub struct Output {
     /// The pages with paths relative to the output root, `/` separated:
     /// the HTML pages and their assets, or the one `fdoc.json`.
     pub pages: Vec<Page>,
-    /// Problems that did not stop generation, such as source files that
-    /// match no group of the layout. The config's own warnings are not
-    /// repeated here.
+    /// Problems in the files that did not stop generation, as
+    /// `<path>: <message>` (markup nested too deep, ...). The config's own
+    /// warnings are not repeated here, and source files that match no group
+    /// of the layout are counted in `stats.skipped`.
     pub warnings: Vec<String>,
     pub stats: Stats,
 }
@@ -143,6 +144,8 @@ pub enum Error {
     /// The metadata reader of [`generate_with`] failed; the message is its
     /// own.
     Read(String),
+    /// A path in `files` is absolute, empty or has a `..` component.
+    InvalidPath(String),
 }
 
 impl fmt::Display for Error {
@@ -152,6 +155,7 @@ impl fmt::Display for Error {
             Error::NoFilesInLayout { total } => write!(f, "none of the {total} source files matches a group of the layout"),
             Error::Metadata { path, message } => write!(f, "{path}: {message}"),
             Error::Read(message) => f.write_str(message),
+            Error::InvalidPath(path) => write!(f, "invalid file path `{path}`: paths are relative, without `..` components"),
         }
     }
 }
@@ -188,7 +192,19 @@ pub fn generate(input: Input) -> Result<Output, Error> {
 /// this way, including the specs its excludes leave out of the sources.
 pub fn generate_with(input: Input, read: &mut dyn FnMut(&str) -> Result<Option<String>, String>) -> Result<Output, Error> {
     let config = input.config.unwrap_or_default();
-    let sources: Vec<File> = input.files.into_iter().filter(|f| is_source_file(f.path.rsplit('/').next().unwrap_or(&f.path))).collect();
+    let mut sources: Vec<File> = Vec::with_capacity(input.files.len());
+    for f in input.files {
+        let path = normalize_path(&f.path)?;
+        if is_source_file(path.rsplit('/').next().unwrap_or(&path)) {
+            sources.push(File { path, text: f.text });
+        }
+    }
+    // The output must not depend on the order of `files`: sort by path
+    // (bytewise, like the directory walk of the command line tool) and keep
+    // the last of several files with one path.
+    sources.reverse();
+    sources.sort_by(|a, b| a.path.cmp(&b.path));
+    sources.dedup_by(|later, earlier| later.path == earlier.path);
     if sources.is_empty() {
         return Err(Error::NoSourceFiles);
     }
@@ -215,10 +231,7 @@ pub fn generate_with(input: Input, read: &mut dyn FnMut(&str) -> Result<Option<S
         return Err(Error::NoFilesInLayout { total });
     }
     let skipped = total - scanned.len();
-    let mut warnings = Vec::new();
-    if skipped > 0 {
-        warnings.push(format!("skipped {skipped} files that match no group of the layout"));
-    }
+    let warnings: Vec<String> = scanned.iter().flat_map(|(path, _, scan)| scan.warnings.iter().map(move |w| format!("{path}: {w}"))).collect();
     let scanned_count = scanned.len();
 
     let fallback = input.fallback_title.as_deref();
@@ -254,6 +267,18 @@ pub fn generate_with(input: Input, read: &mut dyn FnMut(&str) -> Result<Option<S
         Format::Json => vec![Page { path: "fdoc.json".into(), content: json::render(&project) }],
     };
     Ok(Output { pages, warnings, stats })
+}
+
+/// A file path relative to the source root with `/` separators and no
+/// empty or `.` components; `..` components and absolute paths are refused,
+/// so that no page path can leave the output directory.
+fn normalize_path(path: &str) -> Result<String, Error> {
+    let comps: Vec<&str> = path.split(['/', '\\']).filter(|c| !c.is_empty() && *c != ".").collect();
+    let absolute = path.starts_with('/') || path.starts_with('\\') || comps.first().is_some_and(|c| c.len() == 2 && c.ends_with(':'));
+    if comps.is_empty() || absolute || comps.contains(&"..") {
+        return Err(Error::InvalidPath(path.to_string()));
+    }
+    Ok(comps.join("/"))
 }
 
 /// `dir/name`, or `name` in the root.
@@ -402,7 +427,8 @@ pub fn output_to_json(output: &Output, extra_warnings: &[String]) -> String {
         out.push('}');
     }
     out.push_str("],\"warnings\":[");
-    for (i, w) in extra_warnings.iter().chain(&output.warnings).enumerate() {
+    let skipped = (output.stats.skipped > 0).then(|| format!("skipped {} files that match no group of the layout", output.stats.skipped));
+    for (i, w) in extra_warnings.iter().chain(&output.warnings).chain(&skipped).enumerate() {
         if i > 0 {
             out.push(',');
         }
@@ -478,6 +504,47 @@ mod tests {
         assert!(out.pages.iter().any(|p| p.content.contains("Fancy Foo")));
         let files = vec![File::new("plugins/foo/sh_plugin.lua", ""), File::new("plugins/foo/plugin.yml", "name: [unclosed\n")];
         assert!(matches!(generate(Input { files, ..Input::default() }), Err(Error::Metadata { path, .. }) if path == "plugins/foo/plugin.yml"));
+    }
+
+    #[test]
+    fn output_does_not_depend_on_file_order() {
+        let files = vec![
+            File::new("packagespec.lua", spec("Cable")),
+            File::new("lib/b.lua", "--- B.\nfunction cable.b() end\n"),
+            File::new("lib/a.lua", "--- A.\nfunction cable.a() end\n"),
+            File::new("lib/\u{e9}.lua", "--- E.\nfunction cable.e() end\n"),
+            File::new("lib/z.lua", "--- Z.\nfunction cable.z() end\n"),
+        ];
+        let pages = |files: Vec<File>| generate(Input { files, ..Input::default() }).unwrap().pages;
+        let forward = pages(files.clone());
+        let mut reversed = files.clone();
+        reversed.reverse();
+        assert_eq!(forward, pages(reversed));
+        let mut dotted = files;
+        dotted[1].path = "./lib//b.lua".into();
+        assert_eq!(forward, pages(dotted));
+    }
+
+    #[test]
+    fn refuses_paths_that_leave_the_root() {
+        for bad in ["../x.lua", "lib/../../x.lua", "/etc/x.lua", "C:/x.lua", "", "\\\\server\\x.lua"] {
+            let err = generate(Input { files: vec![File::new(bad, "")], ..Input::default() }).unwrap_err();
+            assert_eq!(err, Error::InvalidPath(bad.to_string()), "{bad}");
+        }
+    }
+
+    #[test]
+    fn deep_markup_is_a_warning_not_a_crash() {
+        let depth = 15_000 / 3;
+        let text = format!("return {}{}", "<a>".repeat(depth), "</a>".repeat(depth));
+        let out = std::thread::Builder::new()
+            .stack_size(512 * 1024)
+            .spawn(move || generate(Input { files: vec![File::new("deep.lumen", text)], ..Input::default() }).unwrap())
+            .unwrap()
+            .join()
+            .unwrap();
+        assert_eq!(out.warnings.len(), 1, "{:?}", out.warnings);
+        assert!(out.warnings[0].starts_with("deep.lumen: line 1: markup nests deeper than 256 elements"), "{:?}", out.warnings);
     }
 
     #[test]
