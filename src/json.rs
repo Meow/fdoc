@@ -360,6 +360,202 @@ fn examples(text: &str) -> Vec<(Option<String>, String)> {
     out
 }
 
+/// How deep arrays and objects may nest in [`parse`]'s input.
+const MAX_DEPTH: usize = 256;
+
+/// Parses a JSON document (RFC 8259). Numbers must be integers that fit an
+/// `i64`, since nothing fdoc reads is fractional; anything else is an
+/// error, as is nesting deeper than 256 levels.
+pub fn parse(text: &str) -> Result<Value, String> {
+    let mut p = Parser { s: text.as_bytes(), i: 0 };
+    p.ws();
+    let v = p.value(0)?;
+    p.ws();
+    if p.i < p.s.len() {
+        return Err(p.err("trailing characters"));
+    }
+    Ok(v)
+}
+
+struct Parser<'a> {
+    s: &'a [u8],
+    i: usize,
+}
+
+impl Parser<'_> {
+    fn err(&self, what: &str) -> String {
+        format!("{what} at byte {}", self.i)
+    }
+
+    fn ws(&mut self) {
+        while let Some(b' ' | b'\t' | b'\n' | b'\r') = self.s.get(self.i) {
+            self.i += 1;
+        }
+    }
+
+    fn literal(&mut self, word: &str, v: Value) -> Result<Value, String> {
+        if self.s[self.i..].starts_with(word.as_bytes()) {
+            self.i += word.len();
+            Ok(v)
+        } else {
+            Err(self.err("unexpected character"))
+        }
+    }
+
+    fn value(&mut self, depth: usize) -> Result<Value, String> {
+        if depth > MAX_DEPTH {
+            return Err(self.err("nesting too deep"));
+        }
+        match self.s.get(self.i) {
+            None => Err(self.err("unexpected end of input")),
+            Some(b'n') => self.literal("null", Value::Null),
+            Some(b't') => self.literal("true", Value::Bool(true)),
+            Some(b'f') => self.literal("false", Value::Bool(false)),
+            Some(b'"') => self.string().map(Value::Str),
+            Some(b'-' | b'0'..=b'9') => self.number(),
+            Some(b'[') => {
+                self.i += 1;
+                let mut items = Vec::new();
+                self.ws();
+                if self.s.get(self.i) == Some(&b']') {
+                    self.i += 1;
+                    return Ok(Value::Array(items));
+                }
+                loop {
+                    self.ws();
+                    items.push(self.value(depth + 1)?);
+                    self.ws();
+                    match self.s.get(self.i) {
+                        Some(b',') => self.i += 1,
+                        Some(b']') => {
+                            self.i += 1;
+                            return Ok(Value::Array(items));
+                        }
+                        _ => return Err(self.err("expected `,` or `]`")),
+                    }
+                }
+            }
+            Some(b'{') => {
+                self.i += 1;
+                let mut members = Vec::new();
+                self.ws();
+                if self.s.get(self.i) == Some(&b'}') {
+                    self.i += 1;
+                    return Ok(Value::Object(members));
+                }
+                loop {
+                    self.ws();
+                    if self.s.get(self.i) != Some(&b'"') {
+                        return Err(self.err("expected a member name"));
+                    }
+                    let key = self.string()?;
+                    self.ws();
+                    if self.s.get(self.i) != Some(&b':') {
+                        return Err(self.err("expected `:`"));
+                    }
+                    self.i += 1;
+                    self.ws();
+                    members.push((key, self.value(depth + 1)?));
+                    self.ws();
+                    match self.s.get(self.i) {
+                        Some(b',') => self.i += 1,
+                        Some(b'}') => {
+                            self.i += 1;
+                            return Ok(Value::Object(members));
+                        }
+                        _ => return Err(self.err("expected `,` or `}`")),
+                    }
+                }
+            }
+            Some(_) => Err(self.err("unexpected character")),
+        }
+    }
+
+    fn number(&mut self) -> Result<Value, String> {
+        let start = self.i;
+        if self.s.get(self.i) == Some(&b'-') {
+            self.i += 1;
+        }
+        let digits = self.i;
+        while self.s.get(self.i).is_some_and(u8::is_ascii_digit) {
+            self.i += 1;
+        }
+        if self.i == digits || (self.s[digits] == b'0' && self.i - digits > 1) {
+            return Err(self.err("invalid number"));
+        }
+        if let Some(b'.' | b'e' | b'E') = self.s.get(self.i) {
+            return Err(self.err("only integers are supported"));
+        }
+        // The bytes are ASCII digits with an optional sign.
+        let text = std::str::from_utf8(&self.s[start..self.i]).unwrap_or_default();
+        text.parse::<i64>().map(Value::Int).map_err(|_| self.err("integer out of range"))
+    }
+
+    fn hex4(&mut self) -> Result<u32, String> {
+        let hex = self.s.get(self.i..self.i + 4).ok_or_else(|| self.err("short \\u escape"))?;
+        let hex = std::str::from_utf8(hex).map_err(|_| self.err("invalid \\u escape"))?;
+        let n = u32::from_str_radix(hex, 16).map_err(|_| self.err("invalid \\u escape"))?;
+        self.i += 4;
+        Ok(n)
+    }
+
+    /// A string; `self.i` is at its opening quote.
+    fn string(&mut self) -> Result<String, String> {
+        self.i += 1;
+        let mut out: Vec<u8> = Vec::new();
+        loop {
+            // Copy the run up to the next quote, backslash or control
+            // character in one go.
+            let run = self.s[self.i..].iter().position(|&b| b == b'"' || b == b'\\' || b < 0x20).map_or(self.s.len(), |n| self.i + n);
+            out.extend_from_slice(&self.s[self.i..run]);
+            self.i = run;
+            match self.s.get(self.i) {
+                None => return Err(self.err("unterminated string")),
+                Some(b'"') => {
+                    self.i += 1;
+                    // The input is a `&str` and escapes produce UTF-8.
+                    return String::from_utf8(out).map_err(|_| self.err("invalid UTF-8"));
+                }
+                Some(b'\\') => {
+                    self.i += 1;
+                    let Some(&e) = self.s.get(self.i) else { return Err(self.err("unterminated string")) };
+                    self.i += 1;
+                    let c = match e {
+                        b'"' => '"',
+                        b'\\' => '\\',
+                        b'/' => '/',
+                        b'b' => '\u{8}',
+                        b'f' => '\u{c}',
+                        b'n' => '\n',
+                        b'r' => '\r',
+                        b't' => '\t',
+                        b'u' => {
+                            let hi = self.hex4()?;
+                            let code = if (0xD800..0xDC00).contains(&hi) {
+                                if self.s.get(self.i..self.i + 2) != Some(b"\\u") {
+                                    return Err(self.err("unpaired surrogate"));
+                                }
+                                self.i += 2;
+                                let lo = self.hex4()?;
+                                if !(0xDC00..0xE000).contains(&lo) {
+                                    return Err(self.err("unpaired surrogate"));
+                                }
+                                0x10000 + ((hi - 0xD800) << 10) + (lo - 0xDC00)
+                            } else {
+                                hi
+                            };
+                            char::from_u32(code).ok_or_else(|| self.err("unpaired surrogate"))?
+                        }
+                        _ => return Err(self.err("invalid escape")),
+                    };
+                    out.extend_from_slice(c.encode_utf8(&mut [0; 4]).as_bytes());
+                }
+                Some(_) => return Err(self.err("control character in string")),
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -367,151 +563,6 @@ mod tests {
     use crate::model::{build, placed, BuildOptions};
     use crate::scanner::scan;
     use std::collections::HashMap;
-
-    /// Parses a JSON document (integers only, as fdoc writes no others).
-    fn parse(text: &str) -> Result<Value, String> {
-        let chars: Vec<char> = text.chars().collect();
-        let mut at = 0;
-        let value = parse_value(&chars, &mut at)?;
-        skip_space(&chars, &mut at);
-        if at == chars.len() { Ok(value) } else { Err(format!("trailing text at {at}")) }
-    }
-
-    fn skip_space(chars: &[char], at: &mut usize) {
-        while chars.get(*at).is_some_and(|c| c.is_ascii_whitespace()) {
-            *at += 1;
-        }
-    }
-
-    fn expect(chars: &[char], at: &mut usize, c: char) -> Result<(), String> {
-        skip_space(chars, at);
-        if chars.get(*at) == Some(&c) {
-            *at += 1;
-            Ok(())
-        } else {
-            Err(format!("expected {c:?} at {}", *at))
-        }
-    }
-
-    fn parse_value(chars: &[char], at: &mut usize) -> Result<Value, String> {
-        skip_space(chars, at);
-        let rest: String = chars[*at..chars.len().min(*at + 5)].iter().collect();
-        match chars.get(*at) {
-            Some('"') => parse_string(chars, at).map(Value::Str),
-            Some('[') => {
-                *at += 1;
-                let mut items = Vec::new();
-                skip_space(chars, at);
-                if chars.get(*at) == Some(&']') {
-                    *at += 1;
-                    return Ok(Value::Array(items));
-                }
-                loop {
-                    items.push(parse_value(chars, at)?);
-                    skip_space(chars, at);
-                    match chars.get(*at) {
-                        Some(',') => *at += 1,
-                        Some(']') => {
-                            *at += 1;
-                            return Ok(Value::Array(items));
-                        }
-                        _ => return Err(format!("bad array at {}", *at)),
-                    }
-                }
-            }
-            Some('{') => {
-                *at += 1;
-                let mut members = Vec::new();
-                skip_space(chars, at);
-                if chars.get(*at) == Some(&'}') {
-                    *at += 1;
-                    return Ok(Value::Object(members));
-                }
-                loop {
-                    skip_space(chars, at);
-                    let key = parse_string(chars, at)?;
-                    expect(chars, at, ':')?;
-                    members.push((key, parse_value(chars, at)?));
-                    skip_space(chars, at);
-                    match chars.get(*at) {
-                        Some(',') => *at += 1,
-                        Some('}') => {
-                            *at += 1;
-                            return Ok(Value::Object(members));
-                        }
-                        _ => return Err(format!("bad object at {}", *at)),
-                    }
-                }
-            }
-            _ if rest.starts_with("null") => {
-                *at += 4;
-                Ok(Value::Null)
-            }
-            _ if rest.starts_with("true") => {
-                *at += 4;
-                Ok(Value::Bool(true))
-            }
-            _ if rest.starts_with("false") => {
-                *at += 5;
-                Ok(Value::Bool(false))
-            }
-            Some(c) if *c == '-' || c.is_ascii_digit() => {
-                let start = *at;
-                *at += 1;
-                while chars.get(*at).is_some_and(char::is_ascii_digit) {
-                    *at += 1;
-                }
-                chars[start..*at].iter().collect::<String>().parse().map(Value::Int).map_err(|e| e.to_string())
-            }
-            _ => Err(format!("unexpected text at {}", *at)),
-        }
-    }
-
-    fn parse_string(chars: &[char], at: &mut usize) -> Result<String, String> {
-        expect(chars, at, '"')?;
-        let mut units: Vec<u16> = Vec::new();
-        let mut out = String::new();
-        let flush = |units: &mut Vec<u16>, out: &mut String| -> Result<(), String> {
-            out.push_str(&String::from_utf16(units).map_err(|e| e.to_string())?);
-            units.clear();
-            Ok(())
-        };
-        loop {
-            let c = *chars.get(*at).ok_or("unterminated string")?;
-            *at += 1;
-            match c {
-                '"' => {
-                    flush(&mut units, &mut out)?;
-                    return Ok(out);
-                }
-                '\\' => {
-                    let e = *chars.get(*at).ok_or("bad escape")?;
-                    *at += 1;
-                    if e == 'u' {
-                        let hex: String = chars.get(*at..*at + 4).ok_or("short \\u escape")?.iter().collect();
-                        units.push(u16::from_str_radix(&hex, 16).map_err(|e| e.to_string())?);
-                        *at += 4;
-                        continue;
-                    }
-                    flush(&mut units, &mut out)?;
-                    out.push(match e {
-                        'n' => '\n',
-                        'r' => '\r',
-                        't' => '\t',
-                        'b' => '\u{8}',
-                        'f' => '\u{c}',
-                        '"' | '\\' | '/' => e,
-                        _ => return Err(format!("bad escape \\{e}")),
-                    });
-                }
-                c if (c as u32) < 0x20 => return Err("raw control character in a string".to_string()),
-                c => {
-                    flush(&mut units, &mut out)?;
-                    out.push(c);
-                }
-            }
-        }
-    }
 
     impl Value {
         /// The member `key` of an object, else `Null`.
@@ -641,5 +692,25 @@ mod tests {
         let otherwise = log.get("otherwise");
         assert_eq!((otherwise.get("condition").str(), otherwise.get("summary").str()), ("is_development", "Does nothing."));
         assert_eq!(doc.get("index").get("A#do_x").str(), "core/A.html#do_x");
+    }
+
+    #[test]
+    fn parses_json() {
+        let v = parse(r#" {"a": [1, -2, true, false, null], "b": "x\u00e9\ud83d\ude00\n\"", "c": {}} "#).unwrap();
+        assert_eq!(
+            v,
+            Value::Object(vec![
+                ("a".into(), Value::Array(vec![Value::Int(1), Value::Int(-2), Value::Bool(true), Value::Bool(false), Value::Null])),
+                ("b".into(), Value::Str("x\u{e9}\u{1F600}\n\"".into())),
+                ("c".into(), Value::Object(vec![])),
+            ])
+        );
+        for bad in ["", "[1,]", "{\"a\" 1}", "\"abc", "01", "1.5", "[1] x", "\"\\ud800\"", "\"a\tb\"", "tru"] {
+            assert!(parse(bad).is_err(), "{bad}");
+        }
+        assert!(parse(&"[".repeat(300)).is_err());
+        let mut s = String::new();
+        escape("d\u{e9}j\u{e0} \u{1F600} \"q\"", &mut s);
+        assert_eq!(parse(&s).unwrap(), Value::Str("d\u{e9}j\u{e0} \u{1F600} \"q\"".into()));
     }
 }

@@ -4,6 +4,11 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT"
 
+[lib]
+# rlib for the command line tool, cdylib for the WebAssembly module
+# (`cargo build --release --target wasm32-unknown-unknown`, see src/wasm.rs).
+crate-type = ["rlib", "cdylib"]
+
 [dependencies]
 comrak = { version = "0.57.0", default-features = false }
 yaml-rust2 = { version = "0.13", default-features = false }

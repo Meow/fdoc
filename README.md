@@ -490,6 +490,43 @@ Lua has a single table type, so tables are named after how they are used:
 The element type may be added in angle brackets, as in `List<Item>`. A type
 cannot contain spaces, since the first space ends it.
 
+## Library and WebAssembly
+
+fdoc is also a library. `fdoc::generate(Input) -> Result<Output, Error>`
+takes the files of a source tree in memory (paths relative to its root and
+their text, with an optional title, version, source URL and parsed
+`.fdoc.yml`) and returns the pages (`path` and `content`) the command line
+tool would write, or the one `fdoc.json` with `Format::Json`. The command
+line tool is a directory walker around it. See the documentation comments
+in `src/lib.rs` for which files are read for metadata (`packagespec.lua`,
+`plugin.yml`, `plugin.ini`).
+
+The same code builds to a WebAssembly module with a plain C ABI and no
+imports, for hosts without JS glue such as a Cloudflare Worker:
+
+```sh
+rustup target add wasm32-unknown-unknown
+cargo build --release --target wasm32-unknown-unknown --lib
+# target/wasm32-unknown-unknown/release/fdoc.wasm
+```
+
+(`--lib` keeps the binary target, which also builds to `fdoc.wasm`, out
+of the way.) The exports, described in `src/wasm.rs`:
+
+```text
+fdoc_alloc(len: u32) -> *mut u8
+fdoc_free(ptr: *mut u8, len: u32)
+fdoc_generate(in_ptr: *const u8, in_len: u32, out_len: *mut u32) -> *mut u8
+fdoc_version() -> *const u8      // NUL-terminated
+fdoc_last_panic() -> *const u8   // NUL-terminated, empty if none
+```
+
+`fdoc_generate` reads JSON `{ "title", "version", "source_url", "files":
+[{ "path", "text" }] }` (optionally also `"config"`, the text of a
+`.fdoc.yml`, `"format"`: `"html"` or `"json"`, and `"documented_only"`) and
+returns JSON `{ "pages": [{ "path", "content" }], "warnings": [...] }` or
+`{ "error": "..." }`.
+
 ## Development
 
 ```sh

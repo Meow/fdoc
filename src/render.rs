@@ -8,6 +8,7 @@ use crate::markdown;
 use crate::model::{Function, FunctionKind, Group, Module, ModuleKind, Project};
 use crate::scanner::Sep;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Page {
     /// Path relative to the output root, `/` separated.
     pub path: String,

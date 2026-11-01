@@ -2,26 +2,17 @@
 //! model, from the doc comments of a Lua code base, with its Lumen
 //! templates and NL files.
 
-mod doc;
-mod html;
-mod json;
-mod layout;
-mod lexer;
-mod markdown;
-mod model;
-mod nl;
-mod render;
-mod scanner;
+//!
+//! This is the directory walker around the library (`src/lib.rs`): it
+//! reads the config and the source files, calls `fdoc::generate_with`, and
+//! writes the pages.
 
-use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use layout::{Config, GroupMeta, Layout, Placement};
-use lexer::Syntax;
-use model::{BuildOptions, PlacedFile};
+use fdoc::{Config, Format, Input, is_source_file};
 
 const USAGE: &str = "\
 fdoc - HTML and JSON documentation generator for Lua and NL doc comments
@@ -46,15 +37,6 @@ Options:
   -h, --help              Print this help
   -V, --version           Print the version
 ";
-
-/// What fdoc writes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Format {
-    /// The HTML pages.
-    Html,
-    /// One JSON document of the whole model, `fdoc.json`.
-    Json,
-}
 
 struct Args {
     source: PathBuf,
@@ -82,7 +64,7 @@ fn parse_args() -> Result<Args, String> {
                 std::process::exit(0);
             }
             "-V" | "--version" => {
-                println!("fdoc {}", env!("CARGO_PKG_VERSION"));
+                println!("fdoc {}", fdoc::VERSION);
                 std::process::exit(0);
             }
             "-o" | "--output" => out.output = Some(PathBuf::from(value("--output")?)),
@@ -146,12 +128,6 @@ fn is_excluded(rel: &str, name: &str, is_dir: bool, excludes: &[String]) -> bool
     })
 }
 
-/// True for the name of a file fdoc reads: a Lua file, a Lumen template or
-/// an NL file (`.nl`, `.nlua`), but not an NL declaration file (`.d.nl`).
-fn is_source_file(name: &str) -> bool {
-    [".lua", ".lumen", ".nl", ".nlua"].iter().any(|ext| name.ends_with(ext)) && !name.ends_with(".d.nl")
-}
-
 /// Collects the source files below `root` (Lua files, Lumen templates and
 /// NL files), sorted, as `/` separated paths relative to it.
 fn collect_source_files(root: &Path, excludes: &[String], skip: Option<&Path>) -> Result<Vec<String>, String> {
@@ -179,57 +155,15 @@ fn collect_source_files(root: &Path, excludes: &[String], skip: Option<&Path>) -
     Ok(files)
 }
 
-/// Reads the `plugin.yml` (else `plugin.ini`) in each group's source
-/// directory, by that directory.
-fn read_group_meta(source: &Path, files: &[PlacedFile]) -> Result<HashMap<String, GroupMeta>, String> {
-    let mut meta = HashMap::new();
-    let mut seen = HashSet::new();
-    for (_, place, _) in files {
-        if !seen.insert(place.source_dir.as_str()) {
-            continue;
-        }
-        let dir = source.join(&place.source_dir);
-        let yml = ["plugin.yml", "plugin.yaml"].map(|n| dir.join(n)).into_iter().find(|p| p.is_file());
-        let ini = dir.join("plugin.ini");
-        let parsed = if let Some(yml) = yml {
-            let text = fs::read(&yml).map_err(|e| format!("cannot read {}: {e}", yml.display()))?;
-            Some(layout::parse_plugin_yml(&String::from_utf8_lossy(&text)).map_err(|e| format!("{}: {e}", yml.display()))?)
-        } else if ini.is_file() {
-            let text = fs::read(&ini).map_err(|e| format!("cannot read {}: {e}", ini.display()))?;
-            Some(layout::parse_plugin_ini(&String::from_utf8_lossy(&text)))
-        } else {
-            None
-        };
-        if let Some(parsed) = parsed {
-            meta.insert(place.source_dir.clone(), parsed);
-        }
+/// Reads a metadata file (`packagespec.lua`, `plugin.yml`, ...) for the
+/// library: its text if it is a file below `source`, else `None`.
+fn read_metadata(source: &Path, rel: &str) -> Result<Option<String>, String> {
+    let path = source.join(rel);
+    if !path.is_file() {
+        return Ok(None);
     }
-    Ok(meta)
-}
-
-/// Reads whether each `packagespec.lua` in the directories of the source
-/// files and above them, up to the source root, sets `serverside`, even
-/// where the layout or the excludes leave the spec out. Keyed by directory,
-/// empty for the root.
-fn read_packages(source: &Path, files: &[PlacedFile]) -> Result<HashMap<String, bool>, String> {
-    let mut packages = HashMap::new();
-    let mut seen: HashSet<&str> = HashSet::new();
-    for (path, _, _) in files {
-        let mut dir = path.as_str();
-        while !dir.is_empty() {
-            dir = dir.rfind('/').map_or("", |p| &dir[..p]);
-            if !seen.insert(dir) {
-                break;
-            }
-            let spec = source.join(dir).join("packagespec.lua");
-            if spec.is_file() {
-                let text = fs::read(&spec).map_err(|e| format!("cannot read {}: {e}", spec.display()))?;
-                let scan = scanner::scan_as(&String::from_utf8_lossy(&text), Syntax::Lua);
-                packages.insert(dir.to_string(), scan.serverside);
-            }
-        }
-    }
-    Ok(packages)
+    let text = fs::read(&path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    Ok(Some(String::from_utf8_lossy(&text).into_owned()))
 }
 
 fn same_path(a: &Path, b: &Path) -> bool {
@@ -257,57 +191,38 @@ fn run(args: Args) -> Result<(), String> {
             eprintln!("warning: {name}: {warning}");
         }
     }
-    let title = args.title.as_deref().or(config.title.as_deref());
-    let source_url = args.source_url.as_deref().or(config.source_url.as_deref());
-    let documented_only = args.documented_only || config.documented_only.unwrap_or(false);
     let excludes: Vec<String> = args.excludes.iter().chain(&config.exclude).cloned().collect();
 
     let files = collect_source_files(source, &excludes, (!to_stdout).then_some(output.as_path()))?;
     if files.is_empty() {
         return Err(format!("no .lua, .lumen, .nl or .nlua files found in {}", source.display()));
     }
-    // Only the files inside a group of the layout are scanned (plus the
-    // `packagespec.lua` files `read_packages` looks at). The built-in layout
-    // takes its section title from the root packagespec, which is only
-    // known after scanning; the title does not affect where files go.
+    // Only the files inside a group of the layout are read and scanned; the
+    // library looks up the `packagespec.lua` and `plugin.yml` files itself.
     let total = files.len();
-    let configured = config.layout.is_some();
-    let mut layout = config.layout.unwrap_or_else(|| Layout::default_for(""));
-    let files: Vec<(String, Placement)> = files.into_iter().filter_map(|f| layout.classify(&f).map(|p| (f, p))).collect();
+    let in_layout = fdoc::layout_filter(Some(&config));
+    let files: Vec<String> = files.into_iter().filter(|f| in_layout(f)).collect();
     if files.is_empty() {
         return Err(format!("none of the {total} source files in {} matches a group of the layout", source.display()));
     }
     let skipped = total - files.len();
 
-    let mut scanned: Vec<PlacedFile> = Vec::with_capacity(files.len());
-    for (rel, place) in files {
+    let mut sources = Vec::with_capacity(files.len());
+    for rel in files {
         let path = source.join(&rel);
         let text = fs::read(&path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-        let scan = scanner::scan_file(&String::from_utf8_lossy(&text), &rel);
-        scanned.push((rel, place, scan));
+        sources.push(fdoc::File { path: rel, text: String::from_utf8_lossy(&text).into_owned() });
     }
-    let scanned_count = scanned.len();
 
     let dir_name = source.canonicalize().ok().and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()));
-    if !configured {
-        layout = Layout::default_for(&model::project_title(&scanned, title, dir_name.as_deref()));
-    }
-    let group_meta = read_group_meta(source, &scanned)?;
-    let packages = read_packages(source, &scanned)?;
-    let project = model::build(
-        scanned,
-        BuildOptions {
-            title,
-            fallback_title: dir_name.as_deref(),
-            version: config.version.as_deref(),
-            summary: config.summary.as_deref(),
-            description: config.description.as_deref(),
-            documented_only,
-            source_url,
-            packages: Some(&packages),
-            ..BuildOptions::new(&layout, &group_meta)
-        },
-    );
+    let input = Input { title: args.title.clone(), version: None, source_url: args.source_url.clone(), files: sources, config: Some(config), fallback_title: dir_name, documented_only: args.documented_only, format: args.format };
+    let generated = fdoc::generate_with(input, &mut |rel: &str| read_metadata(source, rel)).map_err(|e| match e {
+        fdoc::Error::Metadata { path, message } => format!("{}: {message}", source.join(path).display()),
+        fdoc::Error::NoSourceFiles => format!("no .lua, .lumen, .nl or .nlua files found in {}", source.display()),
+        fdoc::Error::NoFilesInLayout { total } => format!("none of the {total} source files in {} matches a group of the layout", source.display()),
+        fdoc::Error::Read(message) => message,
+    })?;
+    let stats = generated.stats;
 
     if args.clean && !to_stdout && output.exists() {
         // Both exist at this point, so canonicalising only fails on a
@@ -322,9 +237,9 @@ fn run(args: Args) -> Result<(), String> {
         fs::remove_dir_all(&output).map_err(|e| format!("cannot remove {}: {e}", output.display()))?;
     }
 
+    let pages = generated.pages;
     let written = match args.format {
         Format::Html => {
-            let pages = render::render_all(&project);
             for page in &pages {
                 let path = output.join(&page.path);
                 if let Some(parent) = path.parent() {
@@ -335,22 +250,22 @@ fn run(args: Args) -> Result<(), String> {
             format!("Wrote {} pages to {}", pages.len(), output.display())
         }
         Format::Json if to_stdout => {
-            std::io::stdout().write_all(json::render(&project).as_bytes()).map_err(|e| format!("cannot write to standard output: {e}"))?;
+            let doc = pages.first().map_or("", |p| p.content.as_str());
+            std::io::stdout().write_all(doc.as_bytes()).map_err(|e| format!("cannot write to standard output: {e}"))?;
             "Wrote the JSON document to standard output".to_string()
         }
         Format::Json => {
             fs::create_dir_all(&output).map_err(|e| format!("cannot create {}: {e}", output.display()))?;
             let path = output.join("fdoc.json");
-            fs::write(&path, json::render(&project)).map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+            let doc = pages.first().map_or("", |p| p.content.as_str());
+            fs::write(&path, doc).map_err(|e| format!("cannot write {}: {e}", path.display()))?;
             format!("Wrote {}", path.display())
         }
     };
 
     if !args.quiet {
-        let modules = project.all_modules().count();
-        let functions: usize = project.all_modules().map(|(_, m)| m.functions.len()).sum();
-        let documented: usize = project.all_modules().map(|(_, m)| m.functions.iter().filter(|f| f.doc.is_some()).count()).sum();
-        let mut report = format!("Scanned {scanned_count} files: {modules} modules, {functions} functions ({documented} documented).\n");
+        let (scanned, modules, functions, documented) = (stats.scanned, stats.modules, stats.functions, stats.documented);
+        let mut report = format!("Scanned {scanned} files: {modules} modules, {functions} functions ({documented} documented).\n");
         if skipped > 0 {
             report.push_str(&format!("Skipped {skipped} files that match no group of the layout.\n"));
         }
