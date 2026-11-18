@@ -1,0 +1,6 @@
+# Only what the image build reads.
+*
+!Cargo.toml
+!Cargo.lock
+!assets
+!src

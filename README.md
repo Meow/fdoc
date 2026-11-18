@@ -9,6 +9,24 @@ The output is plain files and works from disk or any static host. The same
 model can be written as one JSON document instead, for tools to read (see
 [JSON output](#json-output)).
 
+## Installation
+
+Each [release](https://github.com/Meow/fdoc/releases) has `fdoc` for Linux
+(x86_64, statically linked) and Windows (x86_64), with a `SHA256SUMS` file.
+To build it from source instead:
+
+```sh
+cargo install --locked --git https://github.com/Meow/fdoc
+```
+
+The `ghcr.io/meow/fdoc` image (amd64 and arm64) has fdoc on Alpine. It is
+tagged with each release's version (`0.2.0`), its minor version (`0.2`) and
+`latest`, and runs in `/src`:
+
+```sh
+docker run --rm -u "$(id -u):$(id -g)" -v "$PWD:/src" ghcr.io/meow/fdoc:0.2 .
+```
+
 ## Usage
 
 ```sh
@@ -534,6 +552,13 @@ returns JSON `{ "pages": [{ "path", "content" }], "warnings": [...] }` or
 ```sh
 cargo test
 ```
+
+To release, bump `version` in `Cargo.toml` and run the Release workflow
+(`gh workflow run release.yml`). It tests and builds fdoc for Linux and
+Windows and drafts the release `v<version>` with the archives attached.
+Running it again while the release is a draft moves the draft to the new
+commit. Publishing the draft creates the tag, and the Docker image workflow
+then pushes `ghcr.io/meow/fdoc` with the version's tags.
 
 ## License
 

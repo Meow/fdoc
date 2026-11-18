@@ -1,0 +1,126 @@
+# Run by hand. Tests and builds fdoc for Linux and Windows and drafts the
+# release v<version from Cargo.toml> at the commit it runs on, with the
+# archives and their SHA256SUMS attached. Running it again while the release
+# is still a draft moves the draft to the new commit and replaces the
+# archives. Publishing the draft creates the tag and the Docker image.
+name: Release
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: release
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  version:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - id: version
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "fdoc") | .version')
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: build (${{ matrix.target }})
+    needs: version
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+            archive: tar.gz
+          - os: windows-2025
+            target: x86_64-pc-windows-msvc
+            archive: zip
+    env:
+      TARGET: ${{ matrix.target }}
+      ARCHIVE: ${{ matrix.archive }}
+      VERSION: ${{ needs.version.outputs.version }}
+      # Link the C runtime statically, so fdoc.exe does not need the Visual
+      # C++ redistributable. (musl binaries are static already.)
+      CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: -C target-feature=+crt-static
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal --target "$TARGET"
+          rustup default stable
+
+      - name: Test
+        run: cargo test --locked --target "$TARGET"
+
+      - name: Build
+        run: cargo build --release --locked --target "$TARGET" --bin fdoc
+
+      - name: Package
+        run: |
+          name="fdoc-$VERSION-$TARGET"
+          mkdir "$name"
+          cp README.md LICENSE "$name/"
+          if [ "$RUNNER_OS" = Windows ]; then
+            cp "target/$TARGET/release/fdoc.exe" "$name/"
+            7z a "$name.$ARCHIVE" "$name"
+          else
+            cp "target/$TARGET/release/fdoc" "$name/"
+            tar -czf "$name.$ARCHIVE" "$name"
+          fi
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.target }}
+          path: fdoc-${{ env.VERSION }}-${{ matrix.target }}.${{ matrix.archive }}
+          if-no-files-found: error
+
+  draft:
+    needs: [version, build]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      VERSION: ${{ needs.version.outputs.version }}
+      TAG: v${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        working-directory: dist
+        run: sha256sum -- * > SHA256SUMS
+
+      - name: Draft the release
+        run: |
+          if ! draft=$(gh release view "$TAG" --json isDraft --jq .isDraft 2>/dev/null); then
+            gh release create "$TAG" dist/* --draft --target "$GITHUB_SHA" --title "fdoc $VERSION" --generate-notes
+          elif [ "$draft" = true ]; then
+            gh release edit "$TAG" --target "$GITHUB_SHA"
+            gh release upload "$TAG" dist/* --clobber
+          else
+            echo "::error::$TAG is already published; bump the version in Cargo.toml first"
+            exit 1
+          fi
+          gh release view "$TAG" --json url --jq .url >> "$GITHUB_STEP_SUMMARY"
