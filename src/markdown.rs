@@ -6,10 +6,10 @@
 //! blocks of NL doc comments are).
 
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::fmt;
 
-use comrak::adapters::SyntaxHighlighterAdapter;
+use comrak::adapters::{SyntaxHighlightMeta, SyntaxHighlighterAdapter};
 use comrak::nodes::{Ast, LineColumn, NodeLink, NodeValue};
 use comrak::options::Plugins;
 use comrak::{format_html_with_plugins, parse_document, Arena, Options};
@@ -30,19 +30,19 @@ fn options() -> Options<'static> {
 struct LuaHighlighter;
 
 impl SyntaxHighlighterAdapter for LuaHighlighter {
-    fn write_highlighted(&self, output: &mut dyn fmt::Write, lang: Option<&str>, code: &str) -> fmt::Result {
-        match lang {
-            None | Some("") | Some("lua") | Some("glua") => output.write_str(&highlight_lua(code)),
-            Some("nl") | Some("nlua") => output.write_str(&highlight_nl(code)),
-            _ => output.write_str(&esc(code)),
+    fn write_highlighted(&self, output: &mut dyn fmt::Write, block: &SyntaxHighlightMeta<'_>) -> fmt::Result {
+        match block.lang {
+            "" | "lua" | "glua" => output.write_str(&highlight_lua(block.code)),
+            "nl" | "nlua" => output.write_str(&highlight_nl(block.code)),
+            _ => output.write_str(&esc(block.code)),
         }
     }
 
-    fn write_pre_tag(&self, output: &mut dyn fmt::Write, _attributes: HashMap<&'static str, Cow<'_, str>>) -> fmt::Result {
+    fn write_pre_tag(&self, output: &mut dyn fmt::Write, _block: &SyntaxHighlightMeta<'_>, _attributes: BTreeMap<&str, Cow<'_, str>>) -> fmt::Result {
         output.write_str("<pre>")
     }
 
-    fn write_code_tag(&self, output: &mut dyn fmt::Write, attributes: HashMap<&'static str, Cow<'_, str>>) -> fmt::Result {
+    fn write_code_tag(&self, output: &mut dyn fmt::Write, _block: &SyntaxHighlightMeta<'_>, attributes: BTreeMap<&str, Cow<'_, str>>) -> fmt::Result {
         let class = attributes.get("class").map(|c| c.to_string()).unwrap_or_else(|| "language-lua".to_string());
         write!(output, "<code class=\"{}\">", esc(&class))
     }
@@ -66,7 +66,7 @@ pub fn render(text: &str, resolve: Resolver) -> String {
             }
         };
         if let Some(url) = replacement {
-            let link = arena.alloc(Ast::new(NodeValue::Link(Box::new(NodeLink { url, title: String::new() })), LineColumn { line: 1, column: 1 }).into());
+            let link = arena.alloc(Ast::new(NodeValue::Link(Box::new(NodeLink::new(url, ""))), LineColumn { line: 1, column: 1 }).into());
             node.insert_before(link);
             node.detach();
             link.append(node);
